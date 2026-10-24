@@ -128,6 +128,55 @@ n_recent = len(
 )
 c5.metric(f"近{recent_window_label}信号", n_recent)
 
+# ---------------- 侧边栏：标的列表近期信号扫描 ----------------
+@st.cache_data(ttl=900, show_spinner=False)
+def scan_recent_signals(tickers_tuple, period, days, pivot_order, min_count, dedup_bars):
+    """扫描标的列表里近期有背离信号的 ticker。使用当前侧边栏参数。"""
+    rows = []
+    for t in tickers_tuple:
+        try:
+            d = tv.load_ohlcv(t, period=period)
+            d = tv.add_indicators(d)
+            bull_s = pd.Series(0, index=d.index)
+            bear_s = pd.Series(0, index=d.index)
+            for n in tv.INDICATORS:
+                b, r = tv.find_divergences(d, d[n], order=pivot_order)
+                bull_s.iloc[b] += 1
+                bear_s.iloc[r] += 1
+            bull = tv.dedup_signals(bull_s[bull_s >= min_count], d, gap=dedup_bars)
+            bear = tv.dedup_signals(bear_s[bear_s >= min_count], d, gap=dedup_bars)
+            sigs = tv.signals_in_window(bull, bear, d, t, days=days)
+            if sigs:
+                latest = sorted(sigs, key=lambda x: x["date"], reverse=True)[0]
+                rows.append({
+                    "ticker": t,
+                    "最新信号": latest["signal"],
+                    "日期": latest["date"],
+                    "共振数": latest["indicator_count"],
+                    "信号数(窗口内)": len(sigs),
+                })
+        except Exception:
+            continue  # 某个标的拉取失败不阻塞整体扫描
+    return pd.DataFrame(rows)
+
+# 放侧边栏：展开面板，不占用主界面
+with st.sidebar.expander(f"🔔 近{recent_window_label}有信号的标的", expanded=True):
+    scan = scan_recent_signals(
+        tuple(tickers), period, recent_window_days,
+        pivot_order, min_count, dedup_bars,
+    )
+    if scan.empty:
+        st.success(f"近 {recent_window_label} 全部标的无背离信号")
+    else:
+        # 底背离绿、顶背离红，便于一眼区分
+        def _color(sig):
+            return "color: #26a69a" if sig == "底背离" else "color: #ef5350"
+        st.dataframe(
+            scan.sort_values("日期", ascending=False).style.map(
+                lambda s: _color(s), subset=["最新信号"]),
+            width="stretch", hide_index=True,
+        )
+
 # ---------------- 主图 ----------------
 fig = make_subplots(rows=1, cols=2, shared_yaxes=True,
                     column_widths=[0.85, 0.15], horizontal_spacing=0.01)
