@@ -257,7 +257,19 @@ def _ohlcv_token(ticker, period):
     return last.split(",", 1)[0]
 
 
-@st.cache_data(ttl="6h", max_entries=32, show_spinner=False)
+_BATCH_OPT_SKIP = frozenset({"KBE", "KRE"})
+
+
+def _points_label(score):
+    if score is None or not np.isfinite(score):
+        return "—"
+    points = float(score) * 100
+    if abs(points) < 0.05:
+        return "0.0"
+    return f"{points:+.1f}"
+
+
+@st.cache_data(ttl="6h", max_entries=64, show_spinner=False)
 def _cached_optimize(ticker, period, data_token):
     """在这段日线上最大化持有 10 日的收缩超额胜率。"""
     del data_token
@@ -290,6 +302,40 @@ def _cached_optimize(ticker, period, data_token):
         "end": df.index[-1].date().isoformat(),
         "n_bars": int(len(df)),
     }
+
+
+def _optimize_listed_tickers(names, period):
+    """除 KBE、KRE 外，把每个标的的固定参数改成当前区间分数最高的一组。"""
+    targets = [
+        name for name in names
+        if name not in _BATCH_OPT_SKIP and tv.safe_chart_name(name) not in _BATCH_OPT_SKIP
+    ]
+    rows = []
+    if not targets:
+        return rows
+    progress = st.sidebar.progress(0.0, text="准备优化")
+    for index, name in enumerate(targets, start=1):
+        progress.progress(
+            (index - 1) / len(targets),
+            text=f"正在优化 {name}（{index}/{len(targets)}）",
+        )
+        try:
+            tv.load_ohlcv(name, period=period)
+            result = _cached_optimize(name, period, _ohlcv_token(name, period))
+        except Exception as exc:
+            rows.append({"标的": name, "分数": "—", "参数": f"失败：{exc}"})
+            continue
+        if result.get("status") != "selected":
+            rows.append({"标的": name, "分数": "—", "参数": "无法优化"})
+            continue
+        _remember_fixed_preset(name, result["preset"])
+        rows.append({
+            "标的": name,
+            "分数": _points_label(result["score"]),
+            "参数": result["preset"]["summary"],
+        })
+    progress.progress(1.0, text=f"已优化 {len(targets)} 个标的")
+    return rows
 
 
 def _show_optimize_result(ticker, result):
@@ -696,6 +742,27 @@ if not ticker:
 period = st.sidebar.selectbox("数据区间", ["2y", "5y", "10y", "max"],
                               index=list(["2y", "5y", "10y", "max"]).index(tv.PERIOD)
                               if tv.PERIOD in ["2y", "5y", "10y", "max"] else 1)
+if st.sidebar.button(
+    "一键优化全部标的",
+    icon=":material/tune:",
+    width="stretch",
+    help="除 KBE、KRE 外，用当前数据区间的日线，按持有 10 日的收缩超额胜率写入固定参数。",
+):
+    st.session_state.batch_opt_rows = _optimize_listed_tickers(tickers, period)
+    st.session_state.batch_opt_period = period
+    st.rerun(scope="app")
+st.sidebar.caption("除 KBE、KRE 外都会写入固定参数。这两只保持原来的参数。")
+_batch_rows = st.session_state.get("batch_opt_rows")
+if _batch_rows and st.session_state.get("batch_opt_period") == period:
+    _batch_window = _EDGE_WINDOW_LABEL.get(period, period)
+    with st.sidebar.expander(f"全部优化结果（近 {_batch_window}）", expanded=False):
+        st.caption("KBE、KRE 没有改。")
+        st.dataframe(
+            pd.DataFrame(_batch_rows),
+            hide_index=True,
+            width="stretch",
+            alt="除 KBE 和 KRE 外各标的的优化分数和参数",
+        )
 timeframe = st.sidebar.selectbox("K线周期", ["日线", "周线"], index=0)
 is_weekly = timeframe == "周线"
 force_refresh = st.sidebar.checkbox("强制重新下载（绕过缓存）", value=False)
