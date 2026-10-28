@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 缓存数据 & 运行产物（不要上传下载的行情数据）
+cache/
+output/
+# 批处理生成的日期目录（2026-10-24/ 等）
+20*/
+
+# 本机工具链接，指向这台电脑上的 Streamlit 安装
+.agents/
+.claude/
+
+# 系统 & 编辑器
+.DS_Store
+.vscode/
+.idea/
+
+# 本地统计产物
+stats_*.csv
+signal_stats_all.csv
+signals_recent.csv
+run_summary.csv
+
+# 密钥
+.streamlit/secrets.toml
+.env
+.env.*
+*.pem
