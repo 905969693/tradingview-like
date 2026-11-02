@@ -8,6 +8,7 @@
 .
 ├── tradingview_realization_v2.py   # 核心模块：指标、背离检测、趋势滤波、统计、绘图、批处理
 ├── dashboard.py                    # Streamlit 交互式复盘界面（需与核心模块同目录）
+├── decision_prompt.py              # 把选中背离填成可复制的研究 prompt（不联网、不调模型）
 ├── backtest_divergence.py          # 单标的回测：信号 → 滞后入场 → 持有 5/10/20 日 → 平仓
 ├── backtest_grid.py                # 参数网格：PIVOT_ORDER(3~6) × MIN_COUNT(3~6) + 热图
 ├── backtest_oos.py                 # 样本外验证：训练段选参数 → 测试段验证（趋势滤波 on/off 对照）
@@ -139,6 +140,9 @@ streamlit run dashboard.py
 `streamlit run dashboard.py` 后浏览器打开 `http://localhost:8501`：
 
 - 左侧选标的、调参数，**全部图表联动重算**；标的下拉自动合并缓存里出现过的 ticker，可直接输入新标的
+- 侧边栏 **数据更新至** 与 **更新至最新**：增量合并 yfinance 日线到 `cache/`，不整段重下
+- 主图横轴按 **显示最近 N 年** 裁剪（无 K 线的区间留空）
+- **决策 prompt**：选近窗口内一条顶/底背离（或无信号时照实说明），生成可复制文本贴到 ChatGPT / Claude
 - 侧边栏"趋势滤波"开关（默认开）+ ADX 强度下拉；统计区分"原始信号 / 趋势滤波后"两个 tab 并列对比
 - 主图可框选缩放、悬停看数值；周末自动断开
 - 统计表基于全量数据计算，不受"显示最近 N 根"的窗口裁剪影响

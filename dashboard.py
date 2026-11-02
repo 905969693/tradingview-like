@@ -31,6 +31,7 @@ except ModuleNotFoundError:
     import tradingview_realization as tv
 
 import backtest_asset_opt as asset_opt
+import decision_prompt as dp
 
 # 选中这些标的时主图直接用这套，不跟侧边栏走。
 # KBE、KRE、IWM、DVY：日线十年、四段中位数入选。KBE 的共振数是 4，3–6 的搜索里它赢过共振 3。
@@ -255,6 +256,46 @@ def _ohlcv_token(ticker, period):
             if line.strip():
                 last = line
     return last.split(",", 1)[0]
+
+
+def _cache_as_of(ticker, period):
+    """本地缓存最后一根 K 线的日期。没有这份缓存时返回 None。"""
+    token = _ohlcv_token(ticker, period)
+    if not token or token == "missing":
+        return None
+    try:
+        ts = pd.Timestamp(token)
+    except (ValueError, TypeError):
+        return None
+    if pd.isna(ts):
+        return None
+    return ts.strftime("%Y-%m-%d")
+
+
+def _refresh_ohlcv_incremental(names, period, parent):
+    """沿用本地缓存，只下载还没有的交易日并合并写回。"""
+    ordered = []
+    seen = set()
+    for name in names:
+        safe = tv.safe_chart_name(name)
+        if not name or safe in seen:
+            continue
+        seen.add(safe)
+        ordered.append(name)
+    errors = []
+    total = len(ordered)
+    progress = parent.progress(0.0, text="准备更新")
+    for index, name in enumerate(ordered, start=1):
+        progress.progress(
+            (index - 1) / total if total else 1.0,
+            text=f"正在更新 {name}（{index}/{total}）",
+        )
+        try:
+            tv.load_ohlcv(name, period=period, use_cache=True)
+        except Exception as exc:
+            errors.append(f"{name}（{exc}）")
+    progress.progress(1.0, text="已合并到本地缓存")
+    return errors
 
 
 _BATCH_OPT_SKIP = frozenset({"KBE", "KRE"})
@@ -638,6 +679,7 @@ def compute_all(
     return dfi, bull_sig, bear_sig, rvp, bull_f, bear_f
 
 # ---------------- 侧边栏 ----------------
+_data_status_slot = st.sidebar.container()
 st.sidebar.title("⚙️ 参数")
 
 # 标的列表：配置里的 + 缓存里出现过的。删除会记在 hidden_tickers.txt，并清掉该标的缓存。
@@ -742,6 +784,40 @@ if not ticker:
 period = st.sidebar.selectbox("数据区间", ["2y", "5y", "10y", "max"],
                               index=list(["2y", "5y", "10y", "max"]).index(tv.PERIOD)
                               if tv.PERIOD in ["2y", "5y", "10y", "max"] else 1)
+_as_of = _cache_as_of(ticker, period)
+with _data_status_slot:
+    if _as_of:
+        st.badge(
+            f"数据更新至 {_as_of}",
+            icon=":material/calendar_today:",
+            color="gray",
+            width="stretch",
+            help=f"{ticker} 在「{period}」区间里，本地缓存的最后一根 K 线。",
+        )
+    else:
+        st.badge(
+            "数据尚未下载",
+            icon=":material/calendar_today:",
+            color="orange",
+            width="stretch",
+            help=f"{ticker} 在「{period}」区间还没有本地缓存。",
+        )
+    if st.button(
+        "更新至最新",
+        key="update_to_latest",
+        icon=":material/refresh:",
+        width="stretch",
+        help="列表里的标的都会补到最新。已有的 K 线会保留，只下载还没有的交易日。",
+    ):
+        _refresh_errors = _refresh_ohlcv_incremental(tickers, period, _data_status_slot)
+        load_data.clear()
+        st.session_state.price_cache_nonce = st.session_state.get("price_cache_nonce", 0) + 1
+        st.session_state.price_refresh_errors = _refresh_errors
+        st.rerun()
+    _refresh_errors = st.session_state.pop("price_refresh_errors", None)
+    if _refresh_errors:
+        st.caption("部分标的没有更新：" + "；".join(_refresh_errors))
+    st.divider()
 if st.sidebar.button(
     "一键优化全部标的",
     icon=":material/tune:",
@@ -766,10 +842,10 @@ if _batch_rows and st.session_state.get("batch_opt_period") == period:
 timeframe = st.sidebar.selectbox("K线周期", ["日线", "周线"], index=0)
 is_weekly = timeframe == "周线"
 force_refresh = st.sidebar.checkbox("强制重新下载（绕过缓存）", value=False)
-if is_weekly:
-    show_bars = st.sidebar.slider("图表显示最近 N 根K线", 26, 260, 104, 13)
-else:
-    show_bars = st.sidebar.slider("图表显示最近 N 根K线", 100, 800, 400, 50)
+show_years = int(st.sidebar.slider(
+    "显示最近 N 年数据", 1, 10, 2, 1,
+    help="横轴固定为最近 N 年。这段里没有 K 线的部分留空。",
+))
 bar_unit = "周" if is_weekly else "根"
 if is_weekly:
     hold_horizon_mode = st.sidebar.selectbox(
@@ -934,11 +1010,11 @@ def _side_edge_10d(df, sig, short, entry_shift):
 
 @st.cache_data(ttl="15m", max_entries=8, show_spinner="按持有 10 日的超额胜率给标的打分")
 def score_ticker_list(
-    tickers_tuple, period, shared_key, preset_rev,
+    tickers_tuple, period, shared_key, preset_rev, data_rev,
     _dedup_rev=tv.DEDUP_LOGIC_REV,
 ):
     """每个标的在自己的参数下，日线持有 10 日的收缩超额胜率。"""
-    del preset_rev, _dedup_rev
+    del preset_rev, data_rev, _dedup_rev
     shared = dict(shared_key)
     scores = {}
     for name in tickers_tuple:
@@ -1057,6 +1133,7 @@ _edge_scores = score_ticker_list(
         for key in _SHARED_EDGE_DEFAULT
     )),
     _preset_cache_key(),
+    st.session_state.get("price_cache_nonce", 0),
 )
 _render_ticker_menu(ticker_menu_slot, tickers, _edge_scores)
 
@@ -1103,9 +1180,12 @@ else:
 bull_plot, bear_plot = (bull_f, bear_f) if trend_on else (bull_sig, bear_sig)
 fib = tv.fib_levels(df, lookback=None if lookback == 0 else int(lookback))
 
-# 显示窗口裁剪（信号/统计仍基于全量数据计算）
-disp = df.iloc[-show_bars:]
-rvp_disp = rvp.iloc[-show_bars:]
+# 显示窗口按年裁剪（信号/统计仍基于全量数据计算）。
+# 横轴始终是最近 N 年；数据没那么长时，左侧留空。
+chart_end = df.index[-1]
+chart_start = chart_end - pd.DateOffset(years=show_years)
+disp = df.loc[df.index >= chart_start]
+rvp_disp = rvp.loc[rvp.index >= chart_start]
 
 # 右侧 Volume Profile：取显示窗口最后 vp_window 根
 vp_result = tv.volume_profile(df)
@@ -1223,10 +1303,11 @@ def scan_dual_timeframe_divergence(
     dedup_bars,
     tolerance,
     preset_rev,
+    data_rev,
     _dedup_rev=tv.DEDUP_LOGIC_REV,
 ):
     """日 K 与周 K 同向背离，且信号日期相差 <= tolerance 个交易日。"""
-    del _dedup_rev
+    del data_rev, _dedup_rev
     rows = []
     for t in tickers_tuple:
         try:
@@ -1290,6 +1371,7 @@ with st.sidebar.expander(
         dedup_bars,
         tv.DUAL_TF_TOLERANCE_DAYS,
         _preset_cache_key(),
+        st.session_state.get("price_cache_nonce", 0),
     )
     if dual.empty:
         st.info("当前列表无日周双周期共振背离")
@@ -1362,8 +1444,8 @@ if trend_on:
 # 背离标注：显示窗口内全部信号；顺势/震荡逆势=实心，剔除=空心「·逆」
 ref_bull = bull_f if trend_on else bull_sig
 ref_bear = bear_f if trend_on else bear_sig
-b_all = bull_sig[bull_sig.index >= disp.index[0]]
-r_all = bear_sig[bear_sig.index >= disp.index[0]]
+b_all = bull_sig[bull_sig.index >= chart_start]
+r_all = bear_sig[bear_sig.index >= chart_start]
 _trend_masks = tv.trend_filter_masks(df, ma_n, adx_th) if trend_on else None
 
 
@@ -1440,8 +1522,10 @@ fig.update_layout(
     height=720,
     legend=dict(orientation="h", y=1.04),
 )
+_price_axis = dict(range=[chart_start, chart_end], row=1, col=1)
 if not is_weekly:
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    _price_axis["rangebreaks"] = [dict(bounds=["sat", "mon"])]
+fig.update_xaxes(**_price_axis)
 st.plotly_chart(fig, width="stretch", alt=f"{ticker} 价格与 Volume Profile")
 
 if trend_on:
@@ -1485,8 +1569,10 @@ if trend_on and adx_th is not None:
         height=150, margin=dict(l=0, r=0, t=25, b=0), showlegend=False,
         title=dict(text=f"ADX 趋势强度 — 虚线=阈值 {adx_th}，虚线上方=趋势够强（保留信号）",
                    font=dict(size=11)))
+    _adx_axis = dict(range=[chart_start, chart_end])
     if not is_weekly:
-        fig_adx.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+        _adx_axis["rangebreaks"] = [dict(bounds=["sat", "mon"])]
+    fig_adx.update_xaxes(**_adx_axis)
     st.plotly_chart(fig_adx, width="stretch", alt="ADX 趋势强度")
 
 # ---------------- 统计区 ----------------
@@ -1569,14 +1655,149 @@ with tab_filt:
         panel_key="filtered",
     )
 
+recent = pd.DataFrame(
+    tv.signals_in_window(
+        bull_plot, bear_plot, df, ticker, days=recent_window_days
+    )
+)
+
+
+def _px(value):
+    number = float(value)
+    if abs(number) >= 100:
+        return f"{number:,.2f}"
+    return f"{number:,.4f}"
+
+
+def _at(series, bar):
+    value = series.loc[bar]
+    if isinstance(value, pd.Series):
+        return value.iloc[-1]
+    return value
+
+
+def _last_date_text():
+    last_ts = pd.Timestamp(df.index[-1])
+    if last_ts.tzinfo is not None:
+        last_ts = last_ts.tz_convert("UTC").tz_localize(None)
+    return last_ts.date().isoformat()
+
+
+def _fib_lines():
+    return [
+        f"{ratio}：{_px(price)}（距现价 {(float(price) / float(last) - 1) * 100:+.2f}%）"
+        for ratio, price in fib.items()
+    ]
+
+
+def _ma_note_at(bar, when):
+    if bar is None:
+        return f"{when}未能对齐到 K 线，MA{ma_n} 位置未计算"
+    ma_val = _at(df.Close.rolling(ma_n).mean(), bar)
+    close_at = _at(df.Close, bar)
+    if pd.isna(ma_val) or float(ma_val) == 0:
+        return f"{when} MA{ma_n} 尚未形成"
+    gap = abs(float(close_at) / float(ma_val) - 1) * 100
+    side = "上方" if float(close_at) >= float(ma_val) else "下方"
+    return f"{when}收盘在 MA{ma_n} {side} {gap:.2f}%（均线 {_px(ma_val)}）"
+
+
+def _adx_note_at(bar, when):
+    if not trend_on or adx_th is None:
+        return "ADX 过滤未启用"
+    if bar is None:
+        return f"ADX 过滤已开启（阈值 {int(adx_th)}），{when}未能对齐"
+    adx_val = _at(tv.adx(df), bar)
+    if pd.isna(adx_val):
+        return f"ADX 过滤已开启（阈值 {int(adx_th)}），{when}数值未算出"
+    return f"{when} ADX(14) 为 {float(adx_val):.1f}，阈值 {int(adx_th)}"
+
+
+def _posterior_text(signal_name):
+    bullish = signal_name == "底背离"
+    if trend_on:
+        stats = stats_bull_f if bullish else stats_bear_f
+    else:
+        stats = stats_bull if bullish else stats_bear
+    return dp.format_posterior(stats)
+
+
+def _prompt_for_signal_row(row):
+    """用当前页已经算好的行情和后验，填这条信号的研究 prompt。"""
+    bar = dp.match_bar(df.index, row["date"])
+    on_chop = False
+    if trend_on and _trend_masks is not None and bar is not None:
+        on_chop = bool(_at(_trend_masks["chop"], bar))
+    if not trend_on:
+        filter_status = "滤波关闭，图上保留全部背离"
+    elif on_chop:
+        filter_status = "震荡段保留（灰色震荡区，顶背离和底背离都保留）"
+    elif _counter:
+        filter_status = "逆势保留"
+    else:
+        filter_status = "顺势保留"
+    return dp.build_decision_prompt(
+        ticker=ticker,
+        timeframe=timeframe,
+        recent_window_label=recent_window_label,
+        signal=row["signal"],
+        signal_date=row["date"],
+        signal_close=row["close"],
+        indicator_count=row["indicator_count"],
+        last_date=_last_date_text(),
+        last_close=float(last),
+        filter_status=filter_status,
+        ma_note=_ma_note_at(bar, "信号日"),
+        adx_note=_adx_note_at(bar, "信号日"),
+        fib_lines=_fib_lines(),
+        poc=float(poc),
+        vah=float(vah),
+        val=float(val),
+        posterior=_posterior_text(row["signal"]),
+    )
+
+
+def _prompt_without_signal():
+    """近窗口没有顶/底背离时，事实段照实写无信号。"""
+    if not trend_on:
+        filter_status = (
+            f"滤波关闭。近 {recent_window_label} 没有底背离，也没有顶背离。"
+        )
+    elif _counter:
+        filter_status = (
+            f"当前规则是逆势保留。近 {recent_window_label} 在该规则下没有保留的信号。"
+        )
+    else:
+        filter_status = (
+            f"当前规则是顺势保留。近 {recent_window_label} 在该规则下没有保留的信号。"
+        )
+    bar = df.index[-1]
+    posterior = (
+        "底背离（历史）：\n"
+        + _posterior_text("底背离")
+        + "\n顶背离（历史）：\n"
+        + _posterior_text("顶背离")
+    )
+    return dp.build_decision_prompt(
+        ticker=ticker,
+        timeframe=timeframe,
+        recent_window_label=recent_window_label,
+        last_date=_last_date_text(),
+        last_close=float(last),
+        filter_status=filter_status,
+        ma_note=_ma_note_at(bar, "最新"),
+        adx_note=_adx_note_at(bar, "最新"),
+        fib_lines=_fib_lines(),
+        poc=float(poc),
+        vah=float(vah),
+        val=float(val),
+        posterior=posterior,
+    )
+
+
 left, right = st.columns([1, 1.4])
 with left:
     st.subheader(f"近 {recent_window_label} 信号")
-    recent = pd.DataFrame(
-        tv.signals_in_window(
-            bull_plot, bear_plot, df, ticker, days=recent_window_days
-        )
-    )
     if recent.empty:
         st.info(f"近 {recent_window_label} 无信号")
     else:
@@ -1590,6 +1811,77 @@ with right:
     fib_display["价位"] = fib_display["价位"].map(lambda x: f"{x:,.2f}")
     fib_display["距现价%"] = fib_display["距现价%"].map(lambda x: f"{x:+.2f}%")
     st.dataframe(fib_display, width="stretch", alt="斐波那契关键位")
+
+with st.container(border=True):
+    st.subheader("决策 prompt")
+    st.caption("生成一段可复制的研究 prompt，贴到 ChatGPT 或 Claude。本页不联网，也不调用模型。")
+    choice_key = f"decision_signal_{ticker}"
+    if recent.empty:
+        st.caption(f"近 {recent_window_label} 无信号。生成时会在 prompt 里照实写明。")
+        clicked = st.button(
+            "生成决策 prompt",
+            icon=":material/edit_note:",
+            type="primary",
+            key=f"gen_decision_prompt_{ticker}",
+        )
+        signal_id = "none"
+        prompt_text = _prompt_without_signal
+    else:
+        ordered = recent.sort_values(["date", "signal"], ascending=[False, True])
+        labels = []
+        label_to_row = {}
+        seen = {}
+        for _, row in ordered.iterrows():
+            label = f"{row['date']} · {row['signal']} · 共振 {int(row['indicator_count'])}"
+            if label in seen:
+                seen[label] += 1
+                label = f"{label} · 收盘 {_px(row['close'])}"
+            else:
+                seen[label] = 1
+            labels.append(label)
+            label_to_row[label] = row
+        if len(labels) == 1:
+            label = labels[0]
+            st.caption(f"当前信号：{label}")
+            clicked = st.button(
+                "生成决策 prompt",
+                icon=":material/edit_note:",
+                type="primary",
+                key=f"gen_decision_prompt_{ticker}",
+            )
+        else:
+            if st.session_state.get(choice_key) not in labels:
+                st.session_state[choice_key] = labels[0]
+            pick, action = st.columns([3, 1], vertical_alignment="bottom")
+            with pick:
+                label = st.selectbox("用哪条信号", labels, key=choice_key)
+            with action:
+                clicked = st.button(
+                    "生成决策 prompt",
+                    icon=":material/edit_note:",
+                    type="primary",
+                    width="stretch",
+                    key=f"gen_decision_prompt_{ticker}",
+                )
+        chosen = label_to_row[label]
+        signal_id = (
+            f"{chosen['date']}|{chosen['signal']}|"
+            f"{int(chosen['indicator_count'])}|{chosen['close']}"
+        )
+        prompt_text = lambda chosen=chosen: _prompt_for_signal_row(chosen)
+    if clicked:
+        st.session_state["decision_prompt"] = {
+            "ticker": ticker,
+            "signal_id": signal_id,
+            "text": prompt_text(),
+        }
+    saved = st.session_state.get("decision_prompt")
+    if (
+        isinstance(saved, dict)
+        and saved.get("ticker") == ticker
+        and saved.get("signal_id") == signal_id
+    ):
+        st.code(saved["text"], language=None, wrap_lines=True)
 
 trend_note = " | 背景色说明见主图下方展开项" if trend_on else ""
 st.caption(
