@@ -653,16 +653,27 @@ def _signal_win_rate(df, sig, pivot, short, horizon=PRIMARY_H):
     return int(np.isfinite(rets).sum()), float((rets > 0).mean())
 
 
-def search_best_edge(df):
-    """在 144 组里最大化持有 10 日的收缩超额胜率。
+def _curve_trade_count(curve):
+    """最短持有期还能出场的信号数。曲线从 3 根起，这一行样本最全。"""
+    if curve is None or curve.empty:
+        return 0
+    return int(curve.iloc[0]["信号数"])
 
+
+def search_best_edge(df):
+    """在 144 组里最大化曲线中位数。
+
+    每一根持有期仍是收缩超额胜率。多空都做时先按笔数合成，再取 3 到 40 根的中位数。
     每一组都比较「多空一起」和「只做多」，取得分更高的那一边。
+    尖峰根数只记在结果里，不参与比较，也不另开搜索维度。
     不要求四段验证合格。没有可用分数时返回 None。
     """
     if "RSI" not in df.columns:
         df = tv.add_indicators(df)
-    base_long = float(tv.unconditional_stats(df, horizons=(PRIMARY_H,), short=False).iloc[0]["无条件胜率"])
-    base_short = float(tv.unconditional_stats(df, horizons=(PRIMARY_H,), short=True).iloc[0]["无条件胜率"])
+    closes = df.Close.to_numpy(dtype=float)
+    span = tv.POSTERIOR_SPAN
+    base_long = tv.unconditional_horizon_baselines(closes, span, short=False)
+    base_short = tv.unconditional_horizon_baselines(closes, span, short=True)
     counts = {pivot: divergence_counts(df, pivot) for pivot in PIVOTS}
     cached_signals = {}
     for pivot in PIVOTS:
@@ -678,13 +689,20 @@ def search_best_edge(df):
     for mode, adx_th, ma_n, pivot, min_count in iter_params():
         bull, bear = cached_signals[(pivot, min_count)]
         bull, bear = apply_mode(df, bull, bear, mode, ma_n, adx_th)
-        long_n, long_win = _signal_win_rate(df, bull, pivot, short=False)
-        short_n, short_win = _signal_win_rate(df, bear, pivot, short=True)
-        long_score = tv.edge_score(long_win, base_long, long_n)
-        short_score = tv.edge_score(short_win, base_short, short_n)
-        both_score = tv.combine_edge_scores(
-            long_score, long_n, short_score, short_n, False,
+        long_curve = tv.hold_edge_curve(
+            df, bull, short=False, entry_shift=pivot, horizons=span, baselines=base_long,
         )
+        short_curve = tv.hold_edge_curve(
+            df, bear, short=True, entry_shift=pivot, horizons=span, baselines=base_short,
+        )
+        long_n = _curve_trade_count(long_curve)
+        short_n = _curve_trade_count(short_curve)
+        long_score = tv.curve_median_edge(long_curve)
+        short_score = tv.curve_median_edge(short_curve)
+        both_score = tv.book_curve_median(long_curve, short_curve, False)
+        long_only_score = tv.book_curve_median(long_curve, short_curve, True)
+        bull_peak = tv.curve_peak_hold(long_curve)
+        bear_peak = tv.curve_peak_hold(short_curve)
         if (
             mode == DEFAULT["mode"]
             and adx_th == DEFAULT["adx_th"]
@@ -695,7 +713,7 @@ def search_best_edge(df):
             baseline = both_score
         candidates = (
             (False, both_score, long_n + short_n),
-            (True, tv.combine_edge_scores(long_score, long_n, short_score, short_n, True), long_n),
+            (True, long_only_score, long_n),
         )
         for long_only, score, n_used in candidates:
             if not np.isfinite(score):
@@ -726,6 +744,8 @@ def search_best_edge(df):
                     "short_n": int(short_n),
                     "long_score": float(long_score) if np.isfinite(long_score) else np.nan,
                     "short_score": float(short_score) if np.isfinite(short_score) else np.nan,
+                    "bull_peak": bull_peak,
+                    "bear_peak": bear_peak,
                 }
     if best is not None:
         best["baseline"] = float(baseline) if np.isfinite(baseline) else np.nan

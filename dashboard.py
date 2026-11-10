@@ -6,10 +6,9 @@
     pip install -r requirements.txt
     streamlit run dashboard.py
 
-左侧选标的/调参数，右侧联动：主图(K线+均线+布林+斐波那契+滚动VP+背离标注)
-+ 信号后验统计表 + 后验收益分布 + 近7日信号。
+左侧选标的/调参数，右侧联动：主图(K线+均线+布林+背离标注)
++ 十字光标/区间测量(A→B) + 信号后验统计表 + 后验收益分布 + 近7日信号。
 """
-import json
 import sys
 from pathlib import Path
 
@@ -32,189 +31,13 @@ except ModuleNotFoundError:
 
 import backtest_asset_opt as asset_opt
 import decision_prompt as dp
+import signal_presets as _presets
 
-# 选中这些标的时主图直接用这套，不跟侧边栏走。
-# KBE、KRE、IWM、DVY：日线十年、四段中位数入选。KBE 的共振数是 4，3–6 的搜索里它赢过共振 3。
-# USDCHF：外汇十年、四段累计收益入选。滤波关闭，均线和 ADX 不参与。
-_USDCHF_PRESET = {
-    "pivot_order": 4,
-    "min_count": 4,
-    "dedup_bars": 10,
-    "trend_on": False,
-    "aligned_keep": True,
-    "adx_th": None,
-    "ma_n": 200,
-    "summary": "滤波关、pivot 4、共振 4、去重 10",
-}
-ASSET_PRESETS = {
-    "KBE": {
-        "pivot_order": 6,
-        "min_count": 4,
-        "dedup_bars": 10,
-        "trend_on": True,
-        "aligned_keep": False,
-        "adx_th": None,
-        "ma_n": 100,
-        "summary": "逆势、ADX 关、MA100、pivot 6、共振 4、去重 10",
-    },
-    "KRE": {
-        "pivot_order": 6,
-        "min_count": 3,
-        "dedup_bars": 10,
-        "trend_on": True,
-        "aligned_keep": True,
-        "adx_th": 25,
-        "ma_n": 200,
-        "summary": "顺势、ADX>25、MA200、pivot 6、共振 3、去重 10",
-    },
-    "IWM": {
-        "pivot_order": 6,
-        "min_count": 3,
-        "dedup_bars": 10,
-        "trend_on": True,
-        "aligned_keep": True,
-        "adx_th": 25,
-        "ma_n": 200,
-        "summary": "顺势、ADX>25、MA200、pivot 6、共振 3、去重 10",
-    },
-    "DVY": {
-        "pivot_order": 6,
-        "min_count": 5,
-        "dedup_bars": 10,
-        "trend_on": False,
-        "aligned_keep": True,
-        "adx_th": None,
-        "ma_n": 200,
-        "summary": "滤波关、pivot 6、共振 5、去重 10",
-    },
-    "USDCHF=X": _USDCHF_PRESET,
-    "USDCHF_X": _USDCHF_PRESET,
-}
-# 一键优化选出更高的 10 日超额胜率后写入这里，覆盖同名的内置预设。
-_USER_PRESETS_PATH = tv.CACHE_DIR / "fixed_presets.json"
-_PRESET_FIELDS = (
-    "pivot_order",
-    "min_count",
-    "dedup_bars",
-    "trend_on",
-    "aligned_keep",
-    "adx_th",
-    "ma_n",
-    "summary",
-)
-_MERGED_PRESETS = dict(ASSET_PRESETS)
-
-
-def _normalize_preset(spec):
-    adx = spec.get("adx_th")
-    if adx in ("", None):
-        adx = None
-    else:
-        adx = int(adx)
-    return {
-        "pivot_order": int(spec["pivot_order"]),
-        "min_count": int(spec["min_count"]),
-        "dedup_bars": int(spec["dedup_bars"]),
-        "trend_on": bool(spec["trend_on"]),
-        "aligned_keep": bool(spec["aligned_keep"]),
-        "adx_th": adx,
-        "ma_n": int(spec["ma_n"]),
-        "long_only": bool(spec.get("long_only", False)),
-        "summary": str(spec.get("summary") or ""),
-        "source": str(spec.get("source") or ""),
-    }
-
-
-def _load_user_presets():
-    if not _USER_PRESETS_PATH.exists():
-        return {}
-    try:
-        raw = json.loads(_USER_PRESETS_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    loaded = {}
-    for ticker, spec in raw.items():
-        if not isinstance(ticker, str) or not isinstance(spec, dict):
-            continue
-        if any(field not in spec for field in _PRESET_FIELDS if field != "summary"):
-            continue
-        try:
-            loaded[ticker] = _normalize_preset(spec)
-        except (TypeError, ValueError):
-            continue
-    return loaded
-
-
-def _reload_presets():
-    global _MERGED_PRESETS
-    merged = dict(ASSET_PRESETS)
-    merged.update(_load_user_presets())
-    _MERGED_PRESETS = merged
-
-
-def _remember_fixed_preset(ticker, spec):
-    """同一标的的 Yahoo 代码和缓存文件名写同一套，避免列表里两套参数。"""
-    user = _load_user_presets()
-    safe = tv.safe_chart_name(ticker)
-    keys = {ticker}
-    for key in list(_MERGED_PRESETS) + list(user):
-        if key and tv.safe_chart_name(key) == safe:
-            keys.add(key)
-    stored = _normalize_preset(spec)
-    for key in keys:
-        user[key] = stored
-    _USER_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _USER_PRESETS_PATH.write_text(
-        json.dumps(user, ensure_ascii=False, indent=2) + "\n"
-    )
-    _reload_presets()
-
-
-def _preset_for(name):
-    """Yahoo 代码和缓存文件名都对得上同一套固定参数。"""
-    if not name:
-        return None
-    if name in _MERGED_PRESETS:
-        return _MERGED_PRESETS[name]
-    safe = tv.safe_chart_name(name)
-    if safe in _MERGED_PRESETS:
-        return _MERGED_PRESETS[safe]
-    for key, spec in _MERGED_PRESETS.items():
-        if tv.safe_chart_name(key) == safe:
-            return spec
-    return None
-
-
-def _listed_preset_tickers():
-    """每个固定参数只列一次，优先用 Yahoo 代码，不重复缓存文件名。"""
-    names = []
-    seen_safe = set()
-    for key in _MERGED_PRESETS:
-        safe = tv.safe_chart_name(key)
-        if safe in seen_safe:
-            continue
-        seen_safe.add(safe)
-        names.append(key)
-    return names
-
-
-def _preset_cache_key():
-    return tuple(
-        (
-            ticker,
-            spec["pivot_order"],
-            spec["min_count"],
-            spec["dedup_bars"],
-            spec["trend_on"],
-            spec["aligned_keep"],
-            spec["adx_th"],
-            spec["ma_n"],
-            bool(spec.get("long_only", False)),
-        )
-        for ticker, spec in sorted(_MERGED_PRESETS.items())
-    )
+_reload_presets = _presets.reload_presets
+_remember_fixed_preset = _presets.remember_fixed_preset
+_preset_for = _presets.preset_for
+_listed_preset_tickers = _presets.listed_preset_tickers
+_preset_cache_key = _presets.preset_cache_key
 
 
 def _presets_match(current, candidate):
@@ -310,9 +133,15 @@ def _points_label(score):
     return f"{points:+.1f}"
 
 
+def _peak_pair_label(bull_peak, bear_peak):
+    left = f"底 {bull_peak}" if bull_peak else "底 —"
+    right = f"顶 {bear_peak}" if bear_peak else "顶 —"
+    return f"{left} / {right}"
+
+
 @st.cache_data(ttl="6h", max_entries=64, show_spinner=False)
 def _cached_optimize(ticker, period, data_token):
-    """在这段日线上最大化持有 10 日的收缩超额胜率。"""
+    """在这段日线上最大化 3 到 40 根收缩超额胜率的中位数。"""
     del data_token
     df = tv.add_indicators(tv.load_ohlcv(ticker, period=period))
     best = asset_opt.search_best_edge(df)
@@ -339,6 +168,8 @@ def _cached_optimize(ticker, period, data_token):
         "short_n": best["short_n"],
         "long_score": best["long_score"],
         "short_score": best["short_score"],
+        "bull_peak": best.get("bull_peak"),
+        "bear_peak": best.get("bear_peak"),
         "start": df.index[0].date().isoformat(),
         "end": df.index[-1].date().isoformat(),
         "n_bars": int(len(df)),
@@ -373,6 +204,7 @@ def _optimize_listed_tickers(names, period):
         rows.append({
             "标的": name,
             "分数": _points_label(result["score"]),
+            "尖峰": _peak_pair_label(result.get("bull_peak"), result.get("bear_peak")),
             "参数": result["preset"]["summary"],
         })
     progress.progress(1.0, text=f"已优化 {len(targets)} 个标的")
@@ -385,17 +217,22 @@ def _show_optimize_result(ticker, result):
     if result["status"] != "selected":
         st.warning(
             f"日线 {result['start']} → {result['end']}（{result['n_bars']} 根）。"
-            "144 组里没有一组能算出持有 10 日的分数。",
+            "144 组里没有一组能算出曲线中位数。",
             title="无法优化",
         )
         return
 
     preset = result["preset"]
     st.markdown(f"**{preset['summary']}**")
-    adopted = "只做多，分数只按底背离" if preset.get("long_only") else "多空按笔数加权"
+    adopted = "只做多，分数只按底背离" if preset.get("long_only") else "每一根先按笔数合成两侧"
+    bull_peak = result.get("bull_peak")
+    bear_peak = result.get("bear_peak")
     st.caption(
         f"日线 {result['start']} → {result['end']}（{result['n_bars']} 根）。"
         f"采用：{adopted}。"
+        "分数是 3–40 根收缩超额胜率的中位数。"
+        "尖峰是该侧超额平均最高的持有根数，只显示，不参与比较。"
+        "笔数是持有 3 根还能出场的信号数。"
         "只做多时，图上和后验表仍会列出顶背离和做空收益。"
     )
     st.dataframe(
@@ -404,25 +241,29 @@ def _show_optimize_result(ticker, result):
                 "项目": "底背离",
                 "笔数": result["long_n"],
                 "分数": _fmt_edge_points(result["long_score"]) or "—",
+                "尖峰": f"{bull_peak} 根" if bull_peak else "—",
             },
             {
                 "项目": "顶背离",
                 "笔数": result["short_n"],
                 "分数": _fmt_edge_points(result["short_score"]) or "—",
+                "尖峰": f"{bear_peak} 根" if bear_peak else "—",
             },
             {
                 "项目": "采用",
                 "笔数": result["n"],
                 "分数": _fmt_edge_points(result["score"]) or "—",
+                "尖峰": "—",
             },
             {
                 "项目": "默认参数",
                 "笔数": "—",
                 "分数": _fmt_edge_points(result["baseline"]) or "—",
+                "尖峰": "—",
             },
         ]),
         hide_index=True,
-        alt="底背离、顶背离、采用分数和默认参数分数",
+        alt="底背离、顶背离、采用分数、默认参数分数和尖峰根数",
     )
     current = _preset_for(ticker)
     if _presets_match(current, preset):
@@ -446,8 +287,9 @@ def _param_optimize_panel(ticker, period):
     with st.container(border=True):
         st.subheader("参数优化")
         st.caption(
-            f"在近 {window} 的日线上搜索 144 组，最大化持有 10 日的收缩超额胜率。"
+            f"在近 {window} 的日线上搜索 144 组，最大化 3–40 根收缩超额胜率的中位数。"
             "每一组都比较多空一起和只做多，取得分更高的。"
+            "尖峰根数只显示，不参与比较，也不搜索持仓天数。"
             "不看四段验证，也不看 2025 至今。"
             "图表切到周线时，这次搜索仍用日线。"
         )
@@ -588,6 +430,114 @@ def _add_trend_vrects(fig, states, row=1, col=1):
         )
 
 
+def _apply_price_chart_crosshair(fig, row=None, col=None):
+    """主图十字光标：spike 线 + 轴上日期/价格标签（Plotly 内置，无需 JS）。
+
+    子图（make_subplots）传 row/col。普通 Figure 不传，否则 Plotly 会要求 subplot 网格。
+    """
+    spike = dict(
+        showspikes=True,
+        spikemode="across+toaxis",
+        spikesnap="cursor",
+        spikecolor="rgba(160,160,160,0.9)",
+        spikethickness=1,
+        spikedash="dot",
+    )
+    axis_kw = {}
+    if row is not None and col is not None:
+        axis_kw = dict(row=row, col=col)
+    fig.update_xaxes(**spike, **axis_kw)
+    fig.update_yaxes(**spike, **axis_kw)
+
+
+def _nearest_index_ts(index, x_val):
+    ts = pd.Timestamp(x_val)
+    pos = index.get_indexer([ts], method="nearest")[0]
+    if pos < 0:
+        return None
+    return index[pos]
+
+
+def _measure_stats(t_a, p_a, t_b, p_b, bar_index):
+    t_lo, t_hi = (t_a, t_b) if t_a <= t_b else (t_b, t_a)
+    p_lo = p_a if t_a <= t_b else p_b
+    p_hi = p_b if t_a <= t_b else p_a
+    pct = (p_hi / p_lo - 1.0) * 100.0 if p_lo else 0.0
+    cal_days = abs((pd.Timestamp(t_b) - pd.Timestamp(t_a)).days)
+    try:
+        i_a = bar_index.get_loc(t_a)
+        i_b = bar_index.get_loc(t_b)
+        if isinstance(i_a, slice):
+            i_a = i_a.start
+        if isinstance(i_b, slice):
+            i_b = i_b.start
+        trade_bars = abs(int(i_b) - int(i_a))
+    except KeyError:
+        trade_bars = None
+    return {
+        "pct": pct,
+        "cal_days": cal_days,
+        "trade_bars": trade_bars,
+        "t_lo": t_lo,
+        "t_hi": t_hi,
+        "p_lo": p_lo,
+        "p_hi": p_hi,
+    }
+
+
+def _add_measure_overlay(fig, t_a, p_a, t_b, p_b, stats, row=1, col=1):
+    fig.add_shape(
+        type="line",
+        x0=t_a,
+        y0=p_a,
+        x1=t_b,
+        y1=p_b,
+        line=dict(color="#ce93d8", width=2, dash="dash"),
+        row=row,
+        col=col,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[t_a, t_b],
+            y=[p_a, p_b],
+            mode="markers+text",
+            marker=dict(size=9, color="#e040fb", symbol="circle"),
+            text=["A", "B"],
+            textposition=["top center", "bottom center"],
+            textfont=dict(size=11, color="#e040fb"),
+            name="区间测量",
+            hovertemplate=(
+                "A %{customdata[0]}<br>收盘 %{customdata[1]:,.2f}<extra></extra>"
+            ),
+            customdata=[
+                [t_a.strftime("%Y-%m-%d"), p_a],
+                [t_b.strftime("%Y-%m-%d"), p_b],
+            ],
+        ),
+        row=row,
+        col=col,
+    )
+    tb = stats["trade_bars"]
+    tb_txt = f"{tb} 根K" if tb is not None else "— 根K"
+    label = (
+        f"Δ {stats['pct']:+.2f}% · {stats['cal_days']} 自然日 · {tb_txt}"
+    )
+    mid_t = t_a + (t_b - t_a) / 2
+    mid_p = (p_a + p_b) / 2
+    fig.add_annotation(
+        x=mid_t,
+        y=mid_p,
+        text=label,
+        showarrow=False,
+        bgcolor="rgba(30,30,30,0.82)",
+        bordercolor="#ce93d8",
+        borderwidth=1,
+        font=dict(color="white", size=11),
+        row=row,
+        col=col,
+    )
+
+
 def _attach_unconditional(stats, base):
     """把同一持有期的无条件胜率和平均收益接到信号表上。"""
     if stats is None or stats.empty:
@@ -654,12 +604,12 @@ def _format_stats_table(stats_df):
 
 @st.cache_data(show_spinner=False)
 def compute_all(
-    df, pivot_order, min_count, dedup_bars, vp_window, ma_n, adx_th,
+    df, pivot_order, min_count, dedup_bars, ma_n, adx_th,
     filter_mode="aligned",
     _filter_rev=tv.TREND_FILTER_LOGIC_REV,
     _dedup_rev=tv.DEDUP_LOGIC_REV,
 ):
-    """信号 + 统计 + 滚动VP + 趋势滤波信号；参数变化时自动重算"""
+    """信号 + 趋势滤波；参数变化时自动重算。"""
     del _filter_rev, _dedup_rev
     dfi = tv.add_indicators(df)
     bull_s = pd.Series(0, index=dfi.index)
@@ -670,13 +620,10 @@ def compute_all(
         bear_s.iloc[r] += 1
     bull_sig = tv.dedup_signals(bull_s[bull_s >= min_count], dfi, gap=dedup_bars)
     bear_sig = tv.dedup_signals(bear_s[bear_s >= min_count], dfi, gap=dedup_bars)
-    rvp = tv.rolling_volume_profile(dfi, window=vp_window)
-    # 趋势滤波：顺势模式（价格在均线上方只留底背离，下方只留顶背离；
-    # adx_th 启用后仅在趋势足够强时保留顺势信号）
     bull_f, bear_f = tv.apply_trend_filter(
         dfi, bull_sig, bear_sig, ma_n=ma_n, mode=filter_mode, adx_th=adx_th,
     )
-    return dfi, bull_sig, bear_sig, rvp, bull_f, bear_f
+    return dfi, bull_sig, bear_sig, bull_f, bear_f
 
 # ---------------- 侧边栏 ----------------
 _data_status_slot = st.sidebar.container()
@@ -822,7 +769,7 @@ if st.sidebar.button(
     "一键优化全部标的",
     icon=":material/tune:",
     width="stretch",
-    help="除 KBE、KRE 外，用当前数据区间的日线，按持有 10 日的收缩超额胜率写入固定参数。",
+    help="除 KBE、KRE 外，用当前数据区间的日线，按曲线中位数写入固定参数。",
 ):
     st.session_state.batch_opt_rows = _optimize_listed_tickers(tickers, period)
     st.session_state.batch_opt_period = period
@@ -842,17 +789,13 @@ if _batch_rows and st.session_state.get("batch_opt_period") == period:
 timeframe = st.sidebar.selectbox("K线周期", ["日线", "周线"], index=0)
 is_weekly = timeframe == "周线"
 force_refresh = st.sidebar.checkbox("强制重新下载（绕过缓存）", value=False)
-show_years = int(st.sidebar.slider(
-    "显示最近 N 年数据", 1, 10, 2, 1,
-    help="横轴固定为最近 N 年。这段里没有 K 线的部分留空。",
-))
 bar_unit = "周" if is_weekly else "根"
 if is_weekly:
     hold_horizon_mode = st.sidebar.selectbox(
         "后验持有期计数",
         ["按周线 K 线根数", "按日线 K 线根数"],
-        help="背离信号仍按周线计算；选「日线」时 5/10/20 表示持有 5/10/20 个交易日，"
-        "入场仍为周线 pivot 确认后的收盘对应交易日。",
+        help="背离信号仍按周线计算。分布图横轴是 3 到 40。"
+        "选「日线」时按交易日计数，入场仍为周线 pivot 确认后的收盘对应交易日。",
     )
     hold_horizon_daily = hold_horizon_mode == "按日线 K 线根数"
 else:
@@ -865,7 +808,7 @@ preset = _preset_for(ticker)
 if preset:
     origin = _edge_origin(preset.get("source"))
     if origin:
-        origin = f"近 {origin}、持有 10 日超额胜率选出"
+        origin = f"近 {origin}、曲线中位数选出"
     else:
         origin = "日线十年样本选出"
     st.sidebar.caption(f"{ticker} 使用固定参数（{origin}）")
@@ -883,10 +826,6 @@ else:
     pivot_order = st.sidebar.slider("pivot 灵敏度 PIVOT_ORDER", 3, 12, tv.PIVOT_ORDER)
     min_count = st.sidebar.slider("共振指标数 MIN_COUNT", 2, 8, tv.MIN_COUNT)
     dedup_bars = st.sidebar.slider("去重窗口 DEDUP_BARS", 5, 30, tv.DEDUP_BARS)
-vp_window = st.sidebar.slider("滚动VP窗口 VP_WINDOW", 30, 150, tv.VP_WINDOW, 10)
-lookback = st.sidebar.number_input("斐波那契波段 LOOKBACK（0=整段）",
-                                   min_value=0, max_value=1500,
-                                   value=0 if tv.LOOKBACK is None else tv.LOOKBACK)
 if preset is None:
     st.sidebar.divider()
     trend_on = st.sidebar.toggle("趋势滤波（只留顺势信号）", value=True,
@@ -943,7 +882,7 @@ _shared_edge = st.session_state.get("shared_edge_params", _SHARED_EDGE_DEFAULT)
 
 
 def _edge_params_for(name, shared):
-    """固定参数用自己的一套。其余用最近一次日线侧边栏。分数始终按日线持有 10 日。"""
+    """固定参数用自己的一套。其余用最近一次日线侧边栏。分数按日线曲线中位数。"""
     spec = _preset_for(name)
     if spec is None:
         trend = bool(shared["trend_on"])
@@ -992,47 +931,40 @@ def _signals_for_edge(df, params):
     bull, bear = tv.apply_trend_filter(
         dfi, bull, bear, ma_n=params["ma_n"], mode=params["mode"], adx_th=params["adx_th"],
     )
-    if params["long_only"]:
-        bear = bear.iloc[0:0]
     return bull, bear
 
 
-def _side_edge_10d(df, sig, short, entry_shift):
-    stats = tv.signal_stats(
-        df, sig, horizons=(10,), short=short, entry_shift=entry_shift,
-    )
-    base = tv.unconditional_stats(df, horizons=(10,), short=short)
-    n = int(stats.iloc[0]["信号数"])
-    win = float(stats.iloc[0]["胜率"])
-    base_win = float(base.iloc[0]["无条件胜率"])
-    return n, tv.edge_score(win, base_win, n)
-
-
-@st.cache_data(ttl="15m", max_entries=8, show_spinner="按持有 10 日的超额胜率给标的打分")
+@st.cache_data(ttl="15m", max_entries=8, show_spinner="按曲线中位数给标的打分")
 def score_ticker_list(
     tickers_tuple, period, shared_key, preset_rev, data_rev,
     _dedup_rev=tv.DEDUP_LOGIC_REV,
 ):
-    """每个标的在自己的参数下，日线持有 10 日的收缩超额胜率。"""
+    """每个标的在自己的参数下，日线 3–40 根收缩超额胜率的中位数，以及两侧尖峰。"""
     del preset_rev, data_rev, _dedup_rev
     shared = dict(shared_key)
     scores = {}
+    span = tv.POSTERIOR_SPAN
     for name in tickers_tuple:
         try:
             params = _edge_params_for(name, shared)
             data = tv.load_ohlcv(name, period=period)
             bull, bear = _signals_for_edge(data, params)
             shift = params["pivot_order"]
-            long_n, long_score = _side_edge_10d(data, bull, False, shift)
-            if params["long_only"]:
-                short_n, short_score = 0, np.nan
-            else:
-                short_n, short_score = _side_edge_10d(data, bear, True, shift)
-            scores[name] = tv.combine_edge_scores(
-                long_score, long_n, short_score, short_n, params["long_only"],
+            long_curve = tv.hold_edge_curve(
+                data, bull, short=False, entry_shift=shift, horizons=span,
             )
+            short_curve = tv.hold_edge_curve(
+                data, bear, short=True, entry_shift=shift, horizons=span,
+            )
+            scores[name] = {
+                "score": tv.book_curve_median(
+                    long_curve, short_curve, long_only=params["long_only"],
+                ),
+                "bull_peak": tv.curve_peak_hold(long_curve),
+                "bear_peak": tv.curve_peak_hold(short_curve),
+            }
         except Exception:
-            scores[name] = np.nan
+            scores[name] = {"score": np.nan, "bull_peak": None, "bear_peak": None}
     return scores
 
 
@@ -1045,17 +977,28 @@ def _fmt_edge_points(score):
     return f"{points:+.1f}"
 
 
+def _ticker_score_parts(scores, item):
+    row = scores.get(item) or {}
+    if not isinstance(row, dict):
+        return np.nan, None, None
+    return row.get("score", np.nan), row.get("bull_peak"), row.get("bear_peak")
+
+
 def _render_ticker_menu(slot, names, scores):
     ordered = sorted(
         names,
         key=lambda item: (
-            not np.isfinite(scores.get(item, np.nan)),
-            -(scores[item] if np.isfinite(scores.get(item, np.nan)) else 0.0),
+            not np.isfinite(_ticker_score_parts(scores, item)[0]),
+            -(
+                _ticker_score_parts(scores, item)[0]
+                if np.isfinite(_ticker_score_parts(scores, item)[0])
+                else 0.0
+            ),
             item,
         ),
     )
     current = st.session_state.ticker_choice
-    current_score = _fmt_edge_points(scores.get(current, np.nan))
+    current_score = _fmt_edge_points(_ticker_score_parts(scores, current)[0])
     label = current or "添加标的"
     if current and _preset_for(current):
         label = f"{label} · 已固定"
@@ -1066,11 +1009,12 @@ def _render_ticker_menu(slot, names, scores):
         with st.popover(
             label,
             width="stretch",
-            help="按日线持有 10 日的分数从高到低。点某一行切换标的。右侧删除会从列表移除，并删除该标的的本地缓存。",
+            help="按曲线中位数从高到低。点某一行切换标的。右侧删除会从列表移除，并删除该标的的本地缓存。",
         ):
             st.caption(
-                "分数是持有 10 日的超额胜率，按笔数收缩后的百分点。"
-                "趋势滤波打开时用滤波后的信号。多空都做时两侧按笔数加权。只做多只算底背离。"
+                "分数是 3–40 根收缩超额胜率的中位数，单位是百分点。"
+                "尖峰根数写在各标的的按钮说明里，不参与排序。"
+                "趋势滤波打开时用滤波后的信号。多空都做时每一根先按笔数加权。只做多只算底背离。"
             )
             new_name = st.text_input(
                 "添加标的",
@@ -1094,13 +1038,23 @@ def _render_ticker_menu(slot, names, scores):
 
             def _ticker_row(item):
                 spec = _preset_for(item)
-                points = _fmt_edge_points(scores.get(item, np.nan))
+                score, bull_peak, bear_peak = _ticker_score_parts(scores, item)
+                points = _fmt_edge_points(score)
                 title = item
                 if spec:
                     title = f"{title} · 已固定"
                 if points:
                     title = f"{title}  {points}"
-                help_text = "日线持有 10 日的收缩超额胜率（百分点）。"
+                peak_bits = []
+                if bull_peak:
+                    peak_bits.append(f"底背离尖峰 {bull_peak} 根")
+                if bear_peak:
+                    peak_bits.append(f"顶背离尖峰 {bear_peak} 根")
+                help_bits = ["曲线中位数是 3–40 根收缩超额胜率的中位数（百分点）"]
+                if peak_bits:
+                    help_bits.append("，".join(peak_bits))
+                help_bits.append("尖峰不参与排序")
+                help_text = "。".join(help_bits) + "。"
                 if spec:
                     help_text = f"{spec['summary']}。{help_text}"
                 pick, remove = st.columns([4, 1], vertical_alignment="center")
@@ -1149,8 +1103,8 @@ if df_raw is None or df_raw.empty:
     st.stop()
 
 filter_mode = "counter" if trend_on and not aligned_keep else "aligned"
-df, bull_sig, bear_sig, rvp, bull_f, bear_f = compute_all(
-    df_raw, pivot_order, min_count, dedup_bars, vp_window, ma_n, adx_th,
+df, bull_sig, bear_sig, bull_f, bear_f = compute_all(
+    df_raw, pivot_order, min_count, dedup_bars, ma_n, adx_th,
     filter_mode,
 )
 df_daily_stats = None
@@ -1165,45 +1119,44 @@ _stats_kw = dict(
     horizon_count_daily=hold_horizon_daily and is_weekly,
     signal_timeframe=signal_tf,
 )
+_span = f"{tv.POSTERIOR_SPAN[0]}–{tv.POSTERIOR_SPAN[-1]}"
 if is_weekly and hold_horizon_daily:
     hold_caption = (
-        f"持有 {', '.join(str(h) for h in tv.STATS_HORIZONS)} 个交易日（出场按日线收盘）"
+        f"汇总表为 {', '.join(str(h) for h in tv.STATS_HORIZONS)} 个交易日；"
+        f"分布图为持有 {_span} 个交易日（出场按日线收盘）"
     )
 elif is_weekly:
     hold_caption = (
-        f"持有 {', '.join(str(h) for h in tv.STATS_HORIZONS)} 周（周线 K 线根数）"
+        f"汇总表为 {', '.join(str(h) for h in tv.STATS_HORIZONS)} 周；"
+        f"分布图为持有 {_span} 周"
     )
 else:
     hold_caption = (
-        f"持有 {', '.join(str(h) for h in tv.STATS_HORIZONS)} 根日线 K 线"
+        f"汇总表为 {', '.join(str(h) for h in tv.STATS_HORIZONS)} 根日线；"
+        f"分布图为持有 {_span} 根日线（40 根约两个月）"
     )
 bull_plot, bear_plot = (bull_f, bear_f) if trend_on else (bull_sig, bear_sig)
-fib = tv.fib_levels(df, lookback=None if lookback == 0 else int(lookback))
 
-# 显示窗口按年裁剪（信号/统计仍基于全量数据计算）。
-# 横轴始终是最近 N 年；数据没那么长时，左侧留空。
+# 主图横轴跟「数据区间」走。2y/5y/10y 是最近对应年数；max 用已加载数据的全长。
+# 信号和后验统计仍用整段已加载数据，不跟着这根轴裁。
+_PERIOD_YEARS = {"2y": 2, "5y": 5, "10y": 10}
 chart_end = df.index[-1]
-chart_start = chart_end - pd.DateOffset(years=show_years)
+if period == "max":
+    chart_start = df.index[0]
+else:
+    chart_start = chart_end - pd.DateOffset(years=_PERIOD_YEARS.get(period, 5))
 disp = df.loc[df.index >= chart_start]
-rvp_disp = rvp.loc[rvp.index >= chart_start]
-
-# 右侧 Volume Profile：取显示窗口最后 vp_window 根
-vp_result = tv.volume_profile(df)
-centers, vp_vol, poc, vah, val = vp_result
 
 # ---------------- 顶部指标条 ----------------
 last = df.Close.iloc[-1]
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2 = st.columns(2)
 c1.metric("最新收盘", f"{last:,.2f}")
-c2.metric("POC", f"{poc:,.2f}", f"{last-poc:+,.2f}")
-c3.metric("VAH", f"{vah:,.2f}", f"{last-vah:+,.2f}")
-c4.metric("VAL", f"{val:,.2f}", f"{last-val:+,.2f}")
 n_recent = len(
     tv.signals_in_window(
         bull_plot, bear_plot, df, ticker, days=recent_window_days
     )
 )
-c5.metric(f"近{recent_window_label}信号", n_recent)
+c2.metric(f"近{recent_window_label}信号", n_recent)
 
 _param_optimize_panel(ticker, period)
 
@@ -1387,11 +1340,26 @@ with st.sidebar.expander(
         )
 
 # ---------------- 主图 ----------------
-fig = make_subplots(rows=1, cols=2, shared_yaxes=True,
-                    column_widths=[0.85, 0.15], horizontal_spacing=0.01)
-fig.add_trace(go.Candlestick(x=disp.index, open=disp.Open, high=disp.High,
-    low=disp.Low, close=disp.Close, name=ticker,
-    increasing_line_color="#26a69a", decreasing_line_color="#ef5350"), row=1, col=1)
+fig = make_subplots(rows=1, cols=1)
+fig.add_trace(
+    go.Candlestick(
+        x=disp.index,
+        open=disp.Open,
+        high=disp.High,
+        low=disp.Low,
+        close=disp.Close,
+        name=ticker,
+        increasing_line_color="#26a69a",
+        decreasing_line_color="#ef5350",
+        hovertemplate=(
+            "日期 %{x|%Y-%m-%d}<br>"
+            "开 %{open:,.2f} 高 %{high:,.2f}<br>"
+            "低 %{low:,.2f} 收 %{close:,.2f}<extra></extra>"
+        ),
+    ),
+    row=1,
+    col=1,
+)
 _td_up, _td_dn = tv.td_sequential_counts(df.Close)
 _td_up = _td_up.reindex(disp.index)
 _td_dn = _td_dn.reindex(disp.index)
@@ -1423,15 +1391,6 @@ fig.add_trace(go.Scatter(x=list(disp.index)+list(disp.index)[::-1],
     y=list(bb_up)+list(bb_lo)[::-1], fill="toself",
     fillcolor="rgba(120,144,156,0.12)", line=dict(color="rgba(0,0,0,0)"),
     name=f"布林({tv.BB_PERIOD},{tv.BB_STD}σ)"), row=1, col=1)
-fig.add_trace(go.Scatter(x=disp.index, y=rvp_disp.POC, name=f"滚动POC({vp_window}{bar_unit})",
-    line=dict(color="#ff9800", width=1, dash="dot")), row=1, col=1)
-fig.add_trace(go.Scatter(x=list(disp.index)+list(disp.index)[::-1],
-    y=list(rvp_disp.VAH)+list(rvp_disp.VAL)[::-1], fill="toself",
-    fillcolor="rgba(38,166,154,0.10)", line=dict(color="rgba(0,0,0,0)"),
-    name="滚动VA"), row=1, col=1)
-for r, p in fib.items():
-    fig.add_hline(y=p, line_dash="dash", line_color="#ff9800", line_width=1,
-                  annotation_text=f"{r}", annotation_font_size=10, row=1, col=1)
 # 趋势背景：与顺势滤波一致；开 ADX 时深绿/深红 = MA 方向且 ADX 过关
 if trend_on:
     ma_line = df.Close.rolling(ma_n).mean().loc[disp.index]
@@ -1508,25 +1467,102 @@ if len(r_drop):
         textposition="top center",
         marker=dict(symbol="triangle-down-open", size=12, color="#6a1b9a"),
         name="顶背离(已过滤)"), row=1, col=1)
-# 右侧 Volume Profile
-fig.add_trace(go.Bar(x=vp_vol, y=centers, orientation="h", showlegend=False,
-    marker_color="rgba(38,166,154,0.6)"), row=1, col=2)
-for p_, lbl, col in [(poc, "POC", "#ff9800"), (vah, "VAH", "#26a69a"), (val, "VAL", "#ef5350")]:
-    fig.add_hline(y=p_, line_color=col, row=1, col=2)
-    fig.add_annotation(x=vp_vol.max()*0.98, y=p_, text=lbl, showarrow=False,
-                       font=dict(color=col, size=10), xanchor="right", row=1, col=2)
 
 fig.update_layout(
-    title=f"{ticker} [{timeframe}] 背离 + 斐波那契 + 布林带 + 滚动 Volume Profile",
+    title=f"{ticker} [{timeframe}] 背离 + 布林带",
     xaxis_rangeslider_visible=False,
     height=720,
     legend=dict(orientation="h", y=1.04),
+    hovermode="x unified",
+    dragmode="zoom",
 )
 _price_axis = dict(range=[chart_start, chart_end], row=1, col=1)
 if not is_weekly:
     _price_axis["rangebreaks"] = [dict(bounds=["sat", "mon"])]
 fig.update_xaxes(**_price_axis)
-st.plotly_chart(fig, width="stretch", alt=f"{ticker} 价格与 Volume Profile")
+_apply_price_chart_crosshair(fig, row=1, col=1)
+
+_chart_safe = tv.safe_chart_name(ticker)
+_main_chart_key = f"main_price_chart_{_chart_safe}"
+_m1, _m2, _m3 = st.columns([1.1, 1, 4])
+_measure_on = _m1.toggle(
+    "区间测量 (A→B)",
+    key=f"measure_toggle_{_chart_safe}",
+    help="用下方日期选 A/B，不占用图表点击；主图可正常框选缩放与滚轮缩放。",
+)
+_disp_d_min = disp.index.min().date()
+_disp_d_max = disp.index.max().date()
+_measure_a_key = f"measure_a_{_chart_safe}"
+_measure_b_key = f"measure_b_{_chart_safe}"
+if _m2.button("重置 A/B", key=f"measure_clear_{_chart_safe}"):
+    st.session_state[_measure_a_key] = _disp_d_min
+    st.session_state[_measure_b_key] = _disp_d_max
+    st.rerun()
+
+_ta = _tb = _pa = _pb = None
+_mstats = None
+if _measure_on:
+    _m3.caption(
+        "在下方选 **起点 A / 终点 B**（自动对齐最近一根 K 线）；"
+        "图表仍可用拖拽框选、滚轮缩放。涨跌幅按 **收盘价** 计算。"
+    )
+    _mda, _mdb = st.columns(2)
+    with _mda:
+        st.date_input(
+            "起点 A",
+            value=_disp_d_min,
+            min_value=_disp_d_min,
+            max_value=_disp_d_max,
+            key=_measure_a_key,
+            help="非交易日会自动对齐到最近的 K 线。",
+        )
+    with _mdb:
+        st.date_input(
+            "终点 B",
+            value=_disp_d_max,
+            min_value=_disp_d_min,
+            max_value=_disp_d_max,
+            key=_measure_b_key,
+        )
+    _ta = _nearest_index_ts(disp.index, st.session_state[_measure_a_key])
+    _tb = _nearest_index_ts(disp.index, st.session_state[_measure_b_key])
+    if _ta is not None and _tb is not None:
+        _pa = float(disp.loc[_ta, "Close"])
+        _pb = float(disp.loc[_tb, "Close"])
+        _mstats = _measure_stats(_ta, _pa, _tb, _pb, disp.index)
+        _add_measure_overlay(fig, _ta, _pa, _tb, _pb, _mstats, row=1, col=1)
+
+_plot_cfg = {
+    "scrollZoom": True,
+    "displaylogo": False,
+}
+st.plotly_chart(
+    fig,
+    width="stretch",
+    alt=f"{ticker} 价格与背离",
+    key=_main_chart_key,
+    on_select="ignore",
+    config=_plot_cfg,
+)
+
+if _measure_on and _mstats is not None:
+    _c1, _c2, _c3, _c4 = st.columns(4)
+    _c1.metric("A → B 涨跌幅", f"{_mstats['pct']:+.2f}%")
+    _c2.metric("自然日跨度", f"{_mstats['cal_days']} 天")
+    _tbars = _mstats["trade_bars"]
+    _c3.metric("K 线根数", f"{_tbars}" if _tbars is not None else "—")
+    _c4.metric(
+        "对齐后区间",
+        f"{_ta.strftime('%Y-%m-%d')} → {_tb.strftime('%Y-%m-%d')}",
+    )
+    if (
+        st.session_state[_measure_a_key] != _ta.date()
+        or st.session_state[_measure_b_key] != _tb.date()
+    ):
+        st.caption(
+            f"日期已对齐到 K 线：A={_ta.strftime('%Y-%m-%d')}，"
+            f"B={_tb.strftime('%Y-%m-%d')}。"
+        )
 
 if trend_on:
     _rule_name = "逆势保留" if _counter else "顺势保留"
@@ -1557,24 +1593,6 @@ if trend_on:
             " 判定按信号当日收盘 vs MA，不是整段 K 线视觉位置。"
         )
 
-# ADX 强度条：只在启用 ADX 过滤时显示，让"趋势是否够强"可见
-if trend_on and adx_th is not None:
-    adx_s = tv.adx(df).loc[disp.index]
-    fig_adx = go.Figure()
-    fig_adx.add_trace(go.Scatter(x=disp.index, y=adx_s, name="ADX(14)",
-        line=dict(color="#ab47bc", width=1.2),
-        fill="tozeroy", fillcolor="rgba(171,71,188,0.10)"))
-    fig_adx.add_hline(y=adx_th, line_dash="dash", line_color="#ef5350", line_width=1)
-    fig_adx.update_layout(
-        height=150, margin=dict(l=0, r=0, t=25, b=0), showlegend=False,
-        title=dict(text=f"ADX 趋势强度 — 虚线=阈值 {adx_th}，虚线上方=趋势够强（保留信号）",
-                   font=dict(size=11)))
-    _adx_axis = dict(range=[chart_start, chart_end])
-    if not is_weekly:
-        _adx_axis["rangebreaks"] = [dict(bounds=["sat", "mon"])]
-    fig_adx.update_xaxes(**_adx_axis)
-    st.plotly_chart(fig_adx, width="stretch", alt="ADX 趋势强度")
-
 # ---------------- 统计区 ----------------
 st.subheader("信号后验统计（基于全量数据）")
 st.caption(
@@ -1582,7 +1600,8 @@ st.caption(
     " 无条件胜率、无条件平均是对照：当前数据区间里，每个还能持满的交易日都按同一方向做一笔。"
     "底背离表按买入，顶背离表按做空。随机抽与信号数相同的时点，期望胜率和平均收益就等于这两列。"
     "对照样本是这些交易日的个数。用来看信号有没有超出这段行情本身的涨跌。"
-    " 分数和 90%下界只填持有 10 日那一行，单位是百分点。"
+    " 分数和 90%下界只填持有 10 日那一行，单位是百分点，用来和旧口径对照。"
+    "标的列表和一键优化用分布图说明里的曲线中位数。"
     "分数 = (信号胜率 − 无条件胜率) × n / (n + 10)。"
     "90%下界 = (信号胜率 − 无条件胜率) − 1.64 × √[信号胜率 × (1 − 信号胜率) / n]。"
     "胜率正好是 0% 或 100% 时，开方项为 0。"
@@ -1620,27 +1639,57 @@ if long_only:
 def _render_posterior_panel(
     bull_s, bear_s, stats_b, stats_be, filt_note=None, panel_key="raw",
 ):
-    col_l, col_r = st.columns([1, 1.4])
+    if filt_note:
+        st.caption(filt_note)
+    col_l, col_r = st.columns(2)
     with col_l:
-        if filt_note:
-            st.caption(filt_note)
         st.markdown("**底背离（期望上涨）**")
         st.dataframe(
             _format_stats_table(stats_b), width="stretch",
             alt="底背离后验统计", key=f"{panel_key}_bull_stats",
         )
+    with col_r:
         st.markdown("**顶背离（期望下跌）**")
         st.dataframe(
             _format_stats_table(stats_be), width="stretch",
             alt="顶背离后验统计", key=f"{panel_key}_bear_stats",
         )
-    with col_r:
-        st.subheader("后验收益分布")
-        fig2 = tv.posterior_returns_plotly(df, bull_s, bear_s, **_stats_kw)
-        st.plotly_chart(
-            fig2, width="stretch", alt="背离信号后验收益分布",
-            key=f"{panel_key}_posterior",
-        )
+    st.subheader("后验收益分布")
+    span_unit = (
+        "个交易日" if _stats_kw["horizon_count_daily"] else ("周" if is_weekly else "根")
+    )
+    bull_curve = tv.hold_edge_curve(
+        df, bull_s, short=False, horizons=tv.POSTERIOR_SPAN,
+        entry_shift=_stats_kw["entry_shift"],
+        daily_df=_stats_kw["daily_df"],
+        horizon_count_daily=_stats_kw["horizon_count_daily"],
+    )
+    bear_curve = tv.hold_edge_curve(
+        df, bear_s, short=True, horizons=tv.POSTERIOR_SPAN,
+        entry_shift=_stats_kw["entry_shift"],
+        daily_df=_stats_kw["daily_df"],
+        horizon_count_daily=_stats_kw["horizon_count_daily"],
+    )
+    curve_score = tv.book_curve_median(bull_curve, bear_curve, long_only=long_only)
+    bull_peak = tv.curve_peak_hold(bull_curve)
+    bear_peak = tv.curve_peak_hold(bear_curve)
+    bull_peak_text = f"{bull_peak} {span_unit}" if bull_peak else "—"
+    bear_peak_text = f"{bear_peak} {span_unit}" if bear_peak else "—"
+    st.caption(
+        "上排未扣无条件平均：实线是信号中位数，灰虚线是无条件中位数。"
+        "下排已扣无条件平均：每笔减去同一持有期、同一方向的无条件平均，实线是超额平均，0 轴表示没有 alpha。"
+        f" 曲线中位数 {_fmt_edge_points(curve_score) or '—'}："
+        f"持有 {tv.POSTERIOR_SPAN[0]}–{tv.POSTERIOR_SPAN[-1]} {span_unit}的收缩超额胜率取中位数。"
+        f"底背离尖峰 {bull_peak_text}，顶背离尖峰 {bear_peak_text}。"
+        "竖线标在该侧超额平均最高的持有期上。这是样本内尖峰，不用于排名。"
+    )
+    fig2 = tv.posterior_returns_plotly(
+        df, bull_s, bear_s, horizons=tv.POSTERIOR_SPAN, **_stats_kw,
+    )
+    st.plotly_chart(
+        fig2, width="stretch", alt="背离信号后验收益分布",
+        key=f"{panel_key}_posterior",
+    )
 
 
 _filt_tab = "趋势滤波后（逆势）" if _counter else "趋势滤波后（顺势）"
@@ -1681,13 +1730,6 @@ def _last_date_text():
     if last_ts.tzinfo is not None:
         last_ts = last_ts.tz_convert("UTC").tz_localize(None)
     return last_ts.date().isoformat()
-
-
-def _fib_lines():
-    return [
-        f"{ratio}：{_px(price)}（距现价 {(float(price) / float(last) - 1) * 100:+.2f}%）"
-        for ratio, price in fib.items()
-    ]
 
 
 def _ma_note_at(bar, when):
@@ -1749,10 +1791,6 @@ def _prompt_for_signal_row(row):
         filter_status=filter_status,
         ma_note=_ma_note_at(bar, "信号日"),
         adx_note=_adx_note_at(bar, "信号日"),
-        fib_lines=_fib_lines(),
-        poc=float(poc),
-        vah=float(vah),
-        val=float(val),
         posterior=_posterior_text(row["signal"]),
     )
 
@@ -1787,30 +1825,15 @@ def _prompt_without_signal():
         filter_status=filter_status,
         ma_note=_ma_note_at(bar, "最新"),
         adx_note=_adx_note_at(bar, "最新"),
-        fib_lines=_fib_lines(),
-        poc=float(poc),
-        vah=float(vah),
-        val=float(val),
         posterior=posterior,
     )
 
 
-left, right = st.columns([1, 1.4])
-with left:
-    st.subheader(f"近 {recent_window_label} 信号")
-    if recent.empty:
-        st.info(f"近 {recent_window_label} 无信号")
-    else:
-        st.dataframe(recent, width="stretch", alt=f"近{recent_window_label}背离信号")
-
-with right:
-    st.subheader("斐波那契关键位")
-    fib_df = pd.DataFrame({"比例": list(fib.keys()), "价位": list(fib.values())})
-    fib_df["距现价%"] = (fib_df["价位"] / last - 1) * 100
-    fib_display = fib_df.copy()
-    fib_display["价位"] = fib_display["价位"].map(lambda x: f"{x:,.2f}")
-    fib_display["距现价%"] = fib_display["距现价%"].map(lambda x: f"{x:+.2f}%")
-    st.dataframe(fib_display, width="stretch", alt="斐波那契关键位")
+st.subheader(f"近 {recent_window_label} 信号")
+if recent.empty:
+    st.info(f"近 {recent_window_label} 无信号")
+else:
+    st.dataframe(recent, width="stretch", alt=f"近{recent_window_label}背离信号")
 
 with st.container(border=True):
     st.subheader("决策 prompt")

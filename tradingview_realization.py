@@ -36,7 +36,6 @@ PERIOD = "2y"
 PIVOT_ORDER = 6
 MIN_COUNT = 3
 DEDUP_BARS = 10
-LOOKBACK = 160
 SIGNAL_RECENT_DAYS = 7
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -164,12 +163,6 @@ def compute_signals(df):
     return bull_sig, bear_sig
 
 
-def fib_levels(df, lookback=LOOKBACK):
-    seg = df if lookback is None else df.iloc[-lookback:]
-    hi, lo = seg.High.max(), seg.Low.min()
-    return {r: hi - (hi - lo) * r for r in [0.236, 0.382, 0.5, 0.618]}
-
-
 def trendline(df, kind="low", n_pts=3, order=8):
     col = df.Low if kind == "low" else df.High
     pts = argrelextrema(col.values, np.less if kind == "low" else np.greater, order=order)[0]
@@ -177,30 +170,6 @@ def trendline(df, kind="low", n_pts=3, order=8):
         return None
     pts = pts[-n_pts:]
     return np.polyfit(pts, col.values[pts], 1)
-
-
-def volume_profile(df, n_bins=40, va_pct=0.70):
-    tp = (df.High + df.Low + df.Close) / 3
-    bins = np.linspace(df.Low.min(), df.High.max(), n_bins + 1)
-    idx = np.clip(np.digitize(tp, bins) - 1, 0, n_bins - 1)
-    vol = np.zeros(n_bins)
-    for i, v in zip(idx, df.Volume):
-        vol[i] += v
-    c = (bins[:-1] + bins[1:]) / 2
-    poc_i = int(np.argmax(vol))
-    lo_i = hi_i = poc_i
-    acc = vol[poc_i]
-    total = vol.sum()
-    while acc < va_pct * total and (lo_i > 0 or hi_i < n_bins - 1):
-        dl = vol[lo_i - 1] if lo_i > 0 else -1
-        dr = vol[hi_i + 1] if hi_i < n_bins - 1 else -1
-        if dr >= dl:
-            hi_i += 1
-            acc += vol[hi_i]
-        else:
-            lo_i -= 1
-            acc += vol[lo_i]
-    return c, vol, c[poc_i], c[hi_i], c[lo_i]
 
 
 def safe_chart_name(ticker):
@@ -239,7 +208,7 @@ def signals_in_window(bull_sig, bear_sig, df, ticker, days=SIGNAL_RECENT_DAYS):
     return rows
 
 
-def plot_chart(df, ticker, bull_sig, bear_sig, fib, save_path):
+def plot_chart(df, ticker, bull_sig, bear_sig, save_path):
     x = np.arange(len(df))
     fig, ax = plt.subplots(figsize=(16, 9), dpi=110)
     up = df.Close >= df.Open
@@ -259,9 +228,6 @@ def plot_chart(df, ticker, bull_sig, bear_sig, fib, save_path):
     ax.plot(x, df.Close.rolling(10).mean(), color="white", lw=1, label="MA10")
     ax.plot(x, df.Close.rolling(20).mean(), color="#42a5f5", lw=1, label="MA20")
     ax.plot(x, df.VWMA, color="#ff9800", lw=1, label="VWMA20")
-    for r, p in fib.items():
-        ax.axhline(p, ls="--", lw=0.7, color="#ff9800", alpha=0.7)
-        ax.text(1, p, f" {r} ({p:,.0f})", fontsize=8, color="#ff9800", va="bottom")
     for kind, color in (("low", "#ffeb3b"), ("high", "#ab47bc")):
         tl = trendline(df, kind)
         if tl is not None:
@@ -287,24 +253,9 @@ def plot_chart(df, ticker, bull_sig, bear_sig, fib, save_path):
             ha="center",
             bbox=dict(boxstyle="round", fc="#ce93d8"),
         )
-    centers, vol, poc, vah, val = volume_profile(df)
-    xr = len(df) * 1.02
-    vmax = vol.max()
-    if not np.isfinite(vmax) or vmax <= 0:
-        vmax = 1.0
-    scale = vol / vmax * len(df) * 0.13
-    in_va = (centers >= val) & (centers <= vah)
-    ax.barh(centers[in_va], scale[in_va], left=xr, color="#26a69a", alpha=0.75)
-    ax.barh(centers[~in_va], scale[~in_va], left=xr, color="#26a69a", alpha=0.25)
-    ax.axhline(poc, color="#ff9800", lw=1.2)
-    ax.text(xr, poc, f" POC {poc:,.0f}", fontsize=9, color="#ff9800", va="bottom")
-    ax.axhline(vah, color="#26a69a", lw=0.9, ls=":")
-    ax.text(xr, vah, f" VAH {vah:,.0f}", fontsize=8, color="#26a69a", va="bottom")
-    ax.axhline(val, color="#ef5350", lw=0.9, ls=":")
-    ax.text(xr, val, f" VAL {val:,.0f}", fontsize=8, color="#ef5350", va="bottom")
-    ax.set_xlim(0, len(df) * 1.18)
+    ax.set_xlim(-0.5, len(df) - 0.5)
     ax.legend(loc="upper left", fontsize=8)
-    ax.set_title(f"{ticker} 背离+斐波那契+趋势线+Volume Profile")
+    ax.set_title(f"{ticker} 背离+趋势线")
     fig.tight_layout()
     fig.savefig(save_path, bbox_inches="tight")
     plt.close(fig)
@@ -313,16 +264,14 @@ def plot_chart(df, ticker, bull_sig, bear_sig, fib, save_path):
 def process_ticker(ticker, out_dir):
     df = add_indicators(load_ohlcv(ticker))
     bull_sig, bear_sig = compute_signals(df)
-    fib = fib_levels(df)
     chart_path = out_dir / f"{safe_chart_name(ticker)}.png"
-    plot_chart(df, ticker, bull_sig, bear_sig, fib, chart_path)
+    plot_chart(df, ticker, bull_sig, bear_sig, chart_path)
     recent = signals_in_window(bull_sig, bear_sig, df, ticker)
     return {
         "ticker": ticker,
         "chart_path": str(chart_path),
         "bull_all": [(str(i.date()), int(v)) for i, v in bull_sig.items()],
         "bear_all": [(str(i.date()), int(v)) for i, v in bear_sig.items()],
-        "fib": {f"fib {r}": round(p, 2) for r, p in fib.items()},
         "recent": recent,
         "error": None,
     }

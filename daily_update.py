@@ -1,0 +1,276 @@
+"""每个交易日早晨增量更新行情，并把新出现的背离信号写成待发送文本。
+
+规则与 Dashboard 侧边栏「近 N 日有信号的标的」相同：有固定参数的标的用自己的一套，
+其余用默认 pivot / 共振 / 去重，且不做趋势滤波。第一次运行只建立基线，不报历史信号。
+之后只有没见过的、且落在近 SIGNAL_RECENT_DAYS 日里的信号才写入
+cache/pending_grok_alert.txt。Grok Bot 读到正文后发到对话里，再把文件改成 NONE。
+
+macOS 计划任务每天 07:00 和 18:10（本机时区）执行本脚本。
+07:00 赶上美股收盘，18:10 赶上港股收盘。
+"""
+import argparse
+import json
+from datetime import datetime
+
+import pandas as pd
+
+import signal_presets as presets
+import tradingview_realization_v2 as tv
+
+STATE_PATH = tv.CACHE_DIR / "signal_state.json"
+ALERT_PATH = tv.CACHE_DIR / "pending_grok_alert.txt"
+NONE_MARK = "NONE"
+
+
+def cache_periods(ticker):
+    safe = tv.safe_chart_name(ticker)
+    prefix = f"{safe}_"
+    periods = []
+    if tv.CACHE_DIR.exists():
+        for path in sorted(tv.CACHE_DIR.glob(f"{safe}_*.csv")):
+            period = path.name[len(prefix):-4]
+            if period:
+                periods.append(period)
+    if tv.PERIOD not in periods:
+        periods.append(tv.PERIOD)
+    return periods
+
+
+def refresh_caches(ticker):
+    last = {}
+    errors = []
+    for period in cache_periods(ticker):
+        try:
+            df = tv.load_ohlcv(ticker, period=period)
+            last[period] = pd.Timestamp(df.index[-1]).date().isoformat()
+        except Exception as exc:
+            errors.append(f"{period}: {exc}")
+    return last, errors
+
+
+def scan_params(ticker):
+    """无固定参数时与侧边栏扫描一致：用默认 pivot，不套趋势滤波。"""
+    spec = presets.preset_for(ticker)
+    if spec is None:
+        return {
+            "pivot_order": tv.PIVOT_ORDER,
+            "min_count": tv.MIN_COUNT,
+            "dedup_bars": tv.DEDUP_BARS,
+            "use_filter": False,
+            "mode": "aligned",
+            "adx_th": None,
+            "ma_n": tv.TREND_MA_N,
+            "rule": "默认参数，未做趋势滤波",
+        }
+    if not spec["trend_on"]:
+        mode = "off"
+    elif spec["aligned_keep"]:
+        mode = "aligned"
+    else:
+        mode = "counter"
+    return {
+        "pivot_order": spec["pivot_order"],
+        "min_count": spec["min_count"],
+        "dedup_bars": spec["dedup_bars"],
+        "use_filter": bool(spec["trend_on"]),
+        "mode": mode,
+        "adx_th": spec["adx_th"],
+        "ma_n": spec["ma_n"],
+        "rule": spec.get("summary") or "",
+    }
+
+
+def recent_signals(ticker, days=tv.SIGNAL_RECENT_DAYS):
+    params = scan_params(ticker)
+    df = tv.add_indicators(tv.load_ohlcv(ticker, period=tv.PERIOD))
+    bull_s = pd.Series(0, index=df.index)
+    bear_s = pd.Series(0, index=df.index)
+    for name in tv.INDICATORS:
+        bull_idx, bear_idx = tv.find_divergences(df, df[name], order=params["pivot_order"])
+        bull_s.iloc[bull_idx] += 1
+        bear_s.iloc[bear_idx] += 1
+    bull = tv.dedup_signals(bull_s[bull_s >= params["min_count"]], df, gap=params["dedup_bars"])
+    bear = tv.dedup_signals(bear_s[bear_s >= params["min_count"]], df, gap=params["dedup_bars"])
+    if params["use_filter"]:
+        bull, bear = tv.apply_trend_filter(
+            df, bull, bear, ma_n=params["ma_n"], mode=params["mode"], adx_th=params["adx_th"],
+        )
+    rows = tv.signals_in_window(bull, bear, df, ticker, days=days)
+    for row in rows:
+        row["rule"] = params["rule"]
+    return rows
+
+
+def signal_key(row):
+    return f"{row['ticker']}|{row['signal_en']}|{row['date']}"
+
+
+def apply_diff(previous, found):
+    """found 只含本次成功扫描的标的。失败的标的沿用上次记录，避免下次误报成新信号。"""
+    next_state = {
+        key: row for key, row in previous.items() if row.get("ticker") not in found
+    }
+    new_rows = []
+    for rows in found.values():
+        for row in rows:
+            key = signal_key(row)
+            if key not in previous:
+                new_rows.append(row)
+            next_state[key] = row
+    new_rows.sort(key=lambda row: (row["date"], row["ticker"], row["signal"]))
+    return new_rows, next_state
+
+
+def format_message(rows):
+    lines = [f"背离信号更新：新增 {len(rows)} 条"]
+    for row in rows:
+        rule = f"（{row['rule']}）" if row.get("rule") else ""
+        lines.append(
+            f"{row['date']}  {row['ticker']}  {row['signal']} ×{row['indicator_count']}"
+            f"  收盘 {row['close']}{rule}"
+        )
+    lines.append("规则与 Dashboard 侧边栏一致。这是复盘提醒，不是买卖建议。")
+    return "\n".join(lines) + "\n"
+
+
+def load_state():
+    if not STATE_PATH.exists():
+        return None
+    try:
+        raw = json.loads(STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    signals = raw.get("signals") if isinstance(raw, dict) else None
+    if not isinstance(signals, dict):
+        return None
+    return signals
+
+
+def save_state(signals):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "signals": signals,
+    }
+    STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def pending_text():
+    if not ALERT_PATH.exists():
+        return ""
+    text = ALERT_PATH.read_text().strip()
+    if not text or text == NONE_MARK:
+        return ""
+    return text
+
+
+def queue_alert(message):
+    previous = pending_text()
+    body = f"{previous}\n\n{message}" if previous else message
+    ALERT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ALERT_PATH.write_text(body)
+
+
+def ack_alert():
+    ALERT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ALERT_PATH.write_text(NONE_MARK + "\n")
+
+
+def run_update():
+    tickers = presets.watchlist()
+    print(f"watchlist {len(tickers)}: {', '.join(tickers)}")
+    found = {}
+    failures = []
+    for ticker in tickers:
+        last, errors = refresh_caches(ticker)
+        if errors and tv.PERIOD not in last:
+            failures.append(f"{ticker}: {'; '.join(errors)}")
+            print(f"[fail] {ticker}: {'; '.join(errors)}")
+            continue
+        try:
+            rows = recent_signals(ticker)
+        except Exception as exc:
+            failures.append(f"{ticker}: {exc}")
+            print(f"[fail] {ticker}: {exc}")
+            continue
+        found[ticker] = rows
+        as_of = last.get(tv.PERIOD, "?")
+        print(f"[ok] {ticker} as_of={as_of} recent={len(rows)}")
+
+    previous = load_state()
+    new_rows, nxt = apply_diff(previous or {}, found)
+    save_state(nxt)
+    if previous is None:
+        print(f"STATUS baseline signals_in_window={sum(len(v) for v in found.values())}")
+        return
+    if not new_rows:
+        print("STATUS no_new")
+        if failures:
+            print("failures: " + " | ".join(failures))
+        return
+    message = format_message(new_rows)
+    queue_alert(message)
+    print("STATUS new")
+    print(message, end="")
+    if failures:
+        print("failures: " + " | ".join(failures))
+
+
+def self_test():
+    previous = {
+        "SPY|bullish_divergence|2026-11-01": {
+            "ticker": "SPY",
+            "signal_en": "bullish_divergence",
+            "signal": "底背离",
+            "date": "2026-11-01",
+        }
+    }
+    found = {
+        "SPY": [
+            previous["SPY|bullish_divergence|2026-11-01"],
+            {
+                "ticker": "SPY",
+                "signal_en": "bearish_divergence",
+                "signal": "顶背离",
+                "date": "2026-11-07",
+                "indicator_count": 4,
+                "close": 700.0,
+                "rule": "测试",
+            },
+        ]
+    }
+    new_rows, nxt = apply_diff(previous, found)
+    assert [row["date"] for row in new_rows] == ["2026-11-07"]
+    assert "SPY|bearish_divergence|2026-11-07" in nxt
+    kept_prev = dict(previous)
+    kept_prev["TLT|bullish_divergence|2026-11-02"] = {
+        "ticker": "TLT",
+        "signal_en": "bullish_divergence",
+        "signal": "底背离",
+        "date": "2026-11-02",
+    }
+    _new_rows, nxt = apply_diff(kept_prev, found)
+    assert "TLT|bullish_divergence|2026-11-02" in nxt
+    empty, nxt = apply_diff(kept_prev, {"SPY": []})
+    assert empty == []
+    assert not any(key.startswith("SPY|") for key in nxt)
+    print("self-test ok")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="增量更新行情，并排队新的背离信号")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--ack", action="store_true", help="把待发送文件标成 NONE")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
+    if args.ack:
+        ack_alert()
+        print("STATUS acked")
+        return
+    run_update()
+
+
+if __name__ == "__main__":
+    main()

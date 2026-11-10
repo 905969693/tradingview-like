@@ -39,15 +39,13 @@ PERIOD = "5y"
 PIVOT_ORDER = 3
 MIN_COUNT = 3
 DEDUP_BARS = 10
-LOOKBACK = 160
 SIGNAL_RECENT_DAYS = 7
 SCRIPT_DIR = Path(__file__).resolve().parent
 CACHE_DIR = SCRIPT_DIR / "cache"          # 新增：数据缓存目录
-VP_WINDOW = 60                             # 新增：滚动 Volume Profile 窗口（交易日）
-VP_BINS = 40                               # 新增：剖面分档数
 BB_PERIOD = 20
 BB_STD = 2.0
-STATS_HORIZONS = (5, 10, 20)               # 新增：信号后验持有期（交易日）
+STATS_HORIZONS = (5, 10, 20)               # 汇总表与回测用的持有期
+POSTERIOR_SPAN = tuple(range(3, 41))       # 分布图：3 到 40 根（约两个月交易日）
 USE_TREND_FILTER = True                    # 新增：批处理信号是否先过顺势滤波
 TREND_MA_N = 200                           # 新增：顺势滤波均线周期（日线 200 / 周线 40）
 # Dashboard @st.cache_data 用此版本号失效旧缓存（改 apply_trend_filter 时递增）
@@ -799,7 +797,7 @@ def unconditional_stats(
     return pd.DataFrame(rows)
 
 
-# 持有 10 日的超额胜率。少于大约 10 笔时只计入一部分。
+# 收缩超额胜率。样本少于大约 10 笔时只计入一部分。10 是笔数，不是持有天数。
 EDGE_PRIOR_N = 10
 EDGE_Z90 = 1.64
 
@@ -835,10 +833,181 @@ def combine_edge_scores(long_score, long_n, short_score, short_n, long_only=Fals
     return sum(score * n for score, n in parts) / weight
 
 
-def fib_levels(df, lookback=LOOKBACK):
-    seg = df if lookback is None else df.iloc[-lookback:]
-    hi, lo = seg.High.max(), seg.Low.min()
-    return {r: hi - (hi - lo) * r for r in [0.236, 0.382, 0.5, 0.618]}
+def unconditional_horizon_baselines(closes, horizons, short=False):
+    """每个持有期的无条件胜率和平均收益，口径与 unconditional_returns 相同。"""
+    closes = np.asarray(closes, dtype=float)
+    wins, means = {}, {}
+    n_bars = len(closes)
+    for horizon in horizons:
+        horizon = int(horizon)
+        last = n_bars - horizon
+        if last <= 0:
+            wins[horizon] = np.nan
+            means[horizon] = np.nan
+            continue
+        entry = closes[:last]
+        exit_px = closes[horizon : horizon + last]
+        ok = np.isfinite(entry) & np.isfinite(exit_px) & (entry != 0)
+        if not ok.any():
+            wins[horizon] = np.nan
+            means[horizon] = np.nan
+            continue
+        rets = exit_px[ok] / entry[ok] - 1.0
+        if short:
+            rets = -rets
+        wins[horizon] = float((rets > 0).mean())
+        means[horizon] = float(rets.mean())
+    return wins, means
+
+
+def _signal_entry_positions(df, sig, entry_shift):
+    if sig is None or len(sig) == 0:
+        return np.array([], dtype=int)
+    pos = df.index.get_indexer(sig.index)
+    keep = pos >= 0
+    return pos[keep] + int(entry_shift)
+
+
+def _signal_horizon_returns(closes, entry_idx, horizon, short):
+    """与 signal_returns 的同周期路径一致：能持满的信号都计入，不过滤价格。"""
+    closes = np.asarray(closes, dtype=float)
+    entry_idx = np.asarray(entry_idx, dtype=int)
+    horizon = int(horizon)
+    if entry_idx.size == 0:
+        return np.array([], dtype=float)
+    exit_i = entry_idx + horizon
+    valid = (entry_idx >= 0) & (exit_i < len(closes))
+    if not valid.any():
+        return np.array([], dtype=float)
+    rets = closes[exit_i[valid]] / closes[entry_idx[valid]] - 1.0
+    if short:
+        rets = -rets
+    return np.asarray(rets, dtype=float)
+
+
+def _curve_row(horizon, rets, base_win, base_mean):
+    rets = np.asarray(rets, dtype=float)
+    n = int(np.isfinite(rets).sum()) if rets.size else 0
+    win = float((rets > 0).mean()) if rets.size else np.nan
+    mean_sig = float(np.mean(rets)) if rets.size and np.isfinite(rets).all() else (
+        float(np.nanmean(rets)) if n else np.nan
+    )
+    excess = (
+        mean_sig - base_mean
+        if np.isfinite(mean_sig) and np.isfinite(base_mean)
+        else np.nan
+    )
+    return {
+        "持有根数": int(horizon),
+        "信号数": n,
+        "胜率": win,
+        "无条件胜率": float(base_win) if np.isfinite(base_win) else np.nan,
+        "分数": edge_score(win, base_win, n),
+        "超额平均": excess,
+    }
+
+
+def hold_edge_curve(
+    df,
+    sig,
+    horizons=POSTERIOR_SPAN,
+    entry_shift=PIVOT_ORDER,
+    short=False,
+    daily_df=None,
+    horizon_count_daily=False,
+    baselines=None,
+):
+    """每个持有期一行：收缩超额胜率，以及信号平均减去无条件平均。
+
+    baselines 是 unconditional_horizon_baselines 的返回值，用来避免重复计算对照。
+    按日线计数的周线持有期仍走 signal_returns，和分布图同一口径。
+    """
+    horizons = tuple(int(h) for h in horizons)
+    rows = []
+    if horizon_count_daily and daily_df is not None and len(daily_df):
+        for horizon in horizons:
+            rets = signal_returns(
+                df, sig, horizon, entry_shift=entry_shift, short=short,
+                daily_df=daily_df, horizon_count_daily=True,
+            )
+            base = unconditional_returns(
+                df, horizon, short=short, daily_df=daily_df, horizon_count_daily=True,
+            )
+            base_win = float((base > 0).mean()) if base.size else np.nan
+            base_mean = float(base.mean()) if base.size else np.nan
+            rows.append(_curve_row(horizon, rets, base_win, base_mean))
+        return pd.DataFrame(rows)
+
+    closes = df.Close.to_numpy(dtype=float)
+    if baselines is None:
+        baselines = unconditional_horizon_baselines(closes, horizons, short=short)
+    base_win, base_mean = baselines
+    entries = _signal_entry_positions(df, sig, entry_shift)
+    for horizon in horizons:
+        rets = _signal_horizon_returns(closes, entries, horizon, short)
+        rows.append(_curve_row(
+            horizon, rets, base_win.get(horizon, np.nan), base_mean.get(horizon, np.nan),
+        ))
+    return pd.DataFrame(rows)
+
+
+def curve_median_edge(curve):
+    """有定义的收缩超额胜率的中位数。某一根没有样本时不计入。"""
+    if curve is None or curve.empty:
+        return np.nan
+    edges = curve["分数"].to_numpy(dtype=float)
+    finite = edges[np.isfinite(edges)]
+    if finite.size == 0:
+        return np.nan
+    return float(np.median(finite))
+
+
+def peak_hold(horizons, values):
+    """超额平均最高的持有根数。并列时取更短的那根。"""
+    best_h = None
+    best_v = None
+    for horizon, value in zip(horizons, values):
+        if value is None or not np.isfinite(value):
+            continue
+        value = float(value)
+        if best_v is None or value > best_v:
+            best_h = int(horizon)
+            best_v = value
+    return best_h
+
+
+def curve_peak_hold(curve):
+    if curve is None or curve.empty:
+        return None
+    return peak_hold(curve["持有根数"].tolist(), curve["超额平均"].tolist())
+
+
+def book_curve_median(long_curve, short_curve, long_only=False):
+    """每一根先按笔数合成两侧，再取这些数的中位数。只做多时只用底背离。"""
+    if long_only or short_curve is None or short_curve.empty:
+        return curve_median_edge(long_curve)
+    if long_curve is None or long_curve.empty:
+        return curve_median_edge(short_curve)
+    left = long_curve.set_index("持有根数")
+    right = short_curve.set_index("持有根数")
+    scores = []
+    for horizon in list(dict.fromkeys([*left.index, *right.index])):
+        if horizon in left.index:
+            long_n = int(left.at[horizon, "信号数"])
+            long_score = float(left.at[horizon, "分数"])
+        else:
+            long_n, long_score = 0, np.nan
+        if horizon in right.index:
+            short_n = int(right.at[horizon, "信号数"])
+            short_score = float(right.at[horizon, "分数"])
+        else:
+            short_n, short_score = 0, np.nan
+        score = combine_edge_scores(long_score, long_n, short_score, short_n, False)
+        if np.isfinite(score):
+            scores.append(float(score))
+    if not scores:
+        return np.nan
+    return float(np.median(np.asarray(scores, dtype=float)))
 
 
 # ============ 趋势滤波（新增） ============
@@ -964,68 +1133,6 @@ def apply_trend_filter(df, bull_sig, bear_sig, ma_n=200,
     return _mask(bull_sig, bull_ok), _mask(bear_sig, bear_ok)
 
 
-# ============ 滚动 Volume Profile（新增，无未来数据） ============
-def _profile_core(tp_vals, vol_vals, n_bins, va_pct):
-    """给定一段典型价/成交量，返回 (档位中心, 各档量, POC, VAH, VAL)。"""
-    lo_b, hi_b = tp_vals.min(), tp_vals.max()
-    if hi_b <= lo_b or vol_vals.sum() <= 0:
-        return None
-    bins = np.linspace(lo_b, hi_b, n_bins + 1)
-    bi = np.clip(np.digitize(tp_vals, bins) - 1, 0, n_bins - 1)
-    vol = np.zeros(n_bins)
-    np.add.at(vol, bi, vol_vals)
-    c = (bins[:-1] + bins[1:]) / 2
-    poc_i = int(np.argmax(vol))
-    lo_i = hi_i = poc_i
-    acc = vol[poc_i]
-    total = vol.sum()
-    while acc < va_pct * total and (lo_i > 0 or hi_i < n_bins - 1):
-        dl = vol[lo_i - 1] if lo_i > 0 else -1
-        dr = vol[hi_i + 1] if hi_i < n_bins - 1 else -1
-        if dr >= dl:
-            hi_i += 1
-            acc += vol[hi_i]
-        else:
-            lo_i -= 1
-            acc += vol[lo_i]
-    return c, vol, c[poc_i], c[hi_i], c[lo_i]
-
-
-def rolling_volume_profile(df, window=VP_WINDOW, n_bins=VP_BINS, va_pct=0.70):
-    """第 t 行的 POC/VAH/VAL 只用到 t-window+1..t 的数据，无前视偏差，可作回测特征。"""
-    tp = ((df.High + df.Low + df.Close) / 3).values
-    vol = df.Volume.values
-    n = len(df)
-    poc = np.full(n, np.nan)
-    vah = np.full(n, np.nan)
-    val = np.full(n, np.nan)
-    for t in range(window - 1, n):
-        r = _profile_core(tp[t - window + 1:t + 1], vol[t - window + 1:t + 1], n_bins, va_pct)
-        if r is not None:
-            _, _, poc[t], vah[t], val[t] = r
-    return pd.DataFrame({"POC": poc, "VAH": vah, "VAL": val}, index=df.index)
-
-
-def volume_profile(df, n_bins=VP_BINS, va_pct=0.70):
-    """整段剖面（右侧面板用）。取最后一个滚动窗口，避免全样本前视。
-
-    部分数据源（如 Yahoo 的外汇对）成交量恒为 0，此时逐级扩大窗口，
-    仍无有效量则退化为按典型价均匀分布的"占位剖面"，保证调用方总能解包。
-    """
-    tp = ((df.High + df.Low + df.Close) / 3).values
-    vol = df.Volume.values
-    for win in (VP_WINDOW, 250, len(df)):
-        if win > len(df):
-            continue
-        r = _profile_core(tp[-win:], vol[-win:], n_bins, va_pct)
-        if r is not None:
-            return r
-    lo_b, hi_b = float(np.nanmin(tp)), float(np.nanmax(tp))
-    edges = np.linspace(lo_b, hi_b, n_bins + 1)
-    centers = (edges[:-1] + edges[1:]) / 2
-    return centers, np.ones(n_bins), centers[n_bins // 2], hi_b, lo_b
-
-
 def safe_chart_name(ticker):
     return re.sub(r'[^\w.\-]+', "_", ticker)
 
@@ -1076,7 +1183,7 @@ def signals_in_window(bull_sig, bear_sig, df, ticker, days=SIGNAL_RECENT_DAYS):
     return rows
 
 
-def plot_chart(df, ticker, bull_sig, bear_sig, fib, save_path, rvp=None,
+def plot_chart(df, ticker, bull_sig, bear_sig, save_path,
                ma_n=TREND_MA_N, use_filter=USE_TREND_FILTER,
                bull_all=None, bear_all=None):
     x = np.arange(len(df))
@@ -1112,14 +1219,6 @@ def plot_chart(df, ticker, bull_sig, bear_sig, fib, save_path, rvp=None,
     ax.plot(x, bb_mid, color="#78909c", lw=0.9, ls="--", alpha=0.85)
     ax.plot(x, bb_upper, color="#78909c", lw=0.65, alpha=0.75)
     ax.plot(x, bb_lower, color="#78909c", lw=0.65, alpha=0.75)
-    # 新增：滚动 POC / VA 带
-    if rvp is not None:
-        ax.plot(x, rvp.POC, color="#ff9800", lw=0.8, alpha=0.5, label=f"滚动POC({VP_WINDOW}d)")
-        ax.fill_between(x, rvp.VAL, rvp.VAH, color="#26a69a", alpha=0.08,
-                        label=f"滚动VA({VP_WINDOW}d)")
-    for r, p in fib.items():
-        ax.axhline(p, ls="--", lw=0.7, color="#ff9800", alpha=0.7)
-        ax.text(1, p, f" {r} ({p:,.0f})", fontsize=8, color="#ff9800", va="bottom")
     # 标注全部背离：顺势保留的实心底色，被滤波剔除的逆势信号用白底描边+"·逆"
     def _annotate(sig_all, kept, kind):
         dropped = set(sig_all.index) - set(kept.index)
@@ -1146,21 +1245,6 @@ def plot_chart(df, ticker, bull_sig, bear_sig, fib, save_path, rvp=None,
 
     _annotate(bull_all if bull_all is not None else bull_sig, bull_sig, "low")
     _annotate(bear_all if bear_all is not None else bear_sig, bear_sig, "high")
-    centers, vol, poc, vah, val = volume_profile(df)
-    xr = len(df) * 1.02
-    vmax = vol.max()
-    if not np.isfinite(vmax) or vmax <= 0:
-        vmax = 1.0
-    scale = vol / vmax * len(df) * 0.13
-    in_va = (centers >= val) & (centers <= vah)
-    ax.barh(centers[in_va], scale[in_va], left=xr, color="#26a69a", alpha=0.75)
-    ax.barh(centers[~in_va], scale[~in_va], left=xr, color="#26a69a", alpha=0.25)
-    ax.axhline(poc, color="#ff9800", lw=1.2)
-    ax.text(xr, poc, f" POC {poc:,.0f}", fontsize=9, color="#ff9800", va="bottom")
-    ax.axhline(vah, color="#26a69a", lw=0.9, ls=":")
-    ax.text(xr, vah, f" VAH {vah:,.0f}", fontsize=8, color="#26a69a", va="bottom")
-    ax.axhline(val, color="#ef5350", lw=0.9, ls=":")
-    ax.text(xr, val, f" VAL {val:,.0f}", fontsize=8, color="#ef5350", va="bottom")
     # 趋势背景着色（与 dashboard 一致）：均线上方绿底=留底背离，下方红底=留顶背离
     if use_filter:
         ma = df.Close.rolling(ma_n).mean()
@@ -1171,10 +1255,10 @@ def plot_chart(df, ticker, bull_sig, bear_sig, fib, save_path, rvp=None,
                         zorder=0, interpolate=True)
         ax.fill_between(x, y0, y1, where=~above, color="#ef5350", alpha=0.07,
                         zorder=0, interpolate=True)
-    ax.set_xlim(0, len(df) * 1.18)
+    ax.set_xlim(-0.5, len(df) - 0.5)
     ax.tick_params(labelbottom=False)
     ax.legend(loc="upper left", fontsize=8)
-    title = f"{ticker} 背离+斐波那契+布林带+滚动Volume Profile"
+    title = f"{ticker} 背离+布林带"
     if use_filter:
         title += f"（趋势背景: 绿=MA{ma_n}上方留底背离/红=下方留顶背离）"
     ax.set_title(title, fontsize=10)
@@ -1183,7 +1267,7 @@ def plot_chart(df, ticker, bull_sig, bear_sig, fib, save_path, rvp=None,
     ax_bb.axhline(0, color="#ef5350", lw=0.7, alpha=0.85)
     ax_bb.axhline(0.5, color="#78909c", lw=0.7, ls=":", alpha=0.85)
     ax_bb.axhline(1, color="#26a69a", lw=0.7, alpha=0.85)
-    ax_bb.set_xlim(0, len(df) * 1.18)
+    ax_bb.set_xlim(-0.5, len(df) - 0.5)
     ax_bb.set_ylabel("(C-mid)/(U-L)", fontsize=8)
     _set_date_xticks(ax_bb, df.index)
     ax_bb.set_xlabel("Date")
@@ -1250,6 +1334,28 @@ def plot_signal_returns(df, ticker, bull_sig, bear_sig, save_path,
     plt.close(fig)
 
 
+def _horizon_axis_title(horizon_count_daily, signal_timeframe):
+    if horizon_count_daily:
+        return "持有交易日"
+    if signal_timeframe == "weekly":
+        return "持有周数"
+    return "持有 K 线根数"
+
+
+def _returns_by_horizon(
+    df, sig, horizons, entry_shift, short, daily_df, horizon_count_daily,
+):
+    """每个持有期一列收益（小数）。信号为空时各列为空数组。"""
+    out = {}
+    for h in horizons:
+        rets = signal_returns(
+            df, sig, h, entry_shift=entry_shift, short=short,
+            daily_df=daily_df, horizon_count_daily=horizon_count_daily,
+        )
+        out[int(h)] = np.asarray(rets, dtype=float)
+    return out
+
+
 def posterior_returns_plotly(
     df,
     bull_sig,
@@ -1260,7 +1366,30 @@ def posterior_returns_plotly(
     horizon_count_daily=False,
     signal_timeframe="daily",
 ):
-    """Dashboard 用：与 plot_signal_returns 同风格的 Plotly strip 图。"""
+    """Dashboard 用的后验收益图。
+
+    持有期不超过 5 档时是分组散点。更长的序列（如 3 到 40）画成两行：
+    上行是原始收益，下行每笔减去同一持有期、同一方向的无条件平均。
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    horizons = tuple(int(h) for h in horizons)
+    if len(horizons) <= 5:
+        return _posterior_strip_plotly(
+            df, bull_sig, bear_sig, entry_shift, horizons,
+            daily_df, horizon_count_daily, signal_timeframe,
+        )
+    return _posterior_span_plotly(
+        df, bull_sig, bear_sig, entry_shift, horizons,
+        daily_df, horizon_count_daily, signal_timeframe,
+    )
+
+
+def _posterior_strip_plotly(
+    df, bull_sig, bear_sig, entry_shift, horizons,
+    daily_df, horizon_count_daily, signal_timeframe,
+):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -1341,6 +1470,188 @@ def posterior_returns_plotly(
     return fig
 
 
+def _posterior_span_plotly(
+    df, bull_sig, bear_sig, entry_shift, horizons,
+    daily_df, horizon_count_daily, signal_timeframe,
+):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    axis_title = _horizon_axis_title(horizon_count_daily, signal_timeframe)
+    if horizon_count_daily:
+        unit = "个交易日"
+    elif signal_timeframe == "weekly":
+        unit = "周"
+    else:
+        unit = "根"
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            "底背离后验（未扣无条件平均）",
+            "顶背离后验（未扣无条件平均）",
+            "底背离后验（已扣无条件平均）",
+            "顶背离后验（已扣无条件平均）",
+        ),
+        horizontal_spacing=0.08,
+        vertical_spacing=0.14,
+    )
+    panels = [
+        (1, bull_sig, False, "#42a5f5", "rgba(66,165,245,0.18)", "底"),
+        (2, bear_sig, True, "#ef5350", "rgba(239,83,80,0.18)", "顶"),
+    ]
+    tickvals = [h for h in horizons if h == horizons[0] or h % 5 == 0]
+    for col, sig, short, color, band, seed_tag in panels:
+        by_h = _returns_by_horizon(
+            df, sig, horizons, entry_shift, short, daily_df, horizon_count_daily,
+        )
+        raw_med, raw_p25, raw_p75 = [], [], []
+        ex_mean, ex_p25, ex_p75 = [], [], []
+        raw_x, raw_y, raw_h = [], [], []
+        ex_x, ex_y, ex_h = [], [], []
+        raw_pct, ex_pct = [], []
+        base_med = []
+        rng = np.random.default_rng(hash(seed_tag) % 2**32)
+        for h in horizons:
+            rets = by_h[h]
+            pct = rets * 100.0
+            base = unconditional_returns(
+                df, h, short=short, daily_df=daily_df,
+                horizon_count_daily=horizon_count_daily,
+            )
+            base_mean = float(np.mean(base) * 100.0) if base.size else np.nan
+            base_med.append(float(np.median(base) * 100.0) if base.size else np.nan)
+            excess = pct - base_mean if pct.size and np.isfinite(base_mean) else pct
+            raw_pct.extend(pct.tolist())
+            ex_pct.extend(excess.tolist())
+            if pct.size:
+                jit = rng.uniform(-0.28, 0.28, pct.size)
+                raw_x.extend((h + jit).tolist())
+                raw_y.extend(pct.tolist())
+                raw_h.extend([h] * int(pct.size))
+                ex_x.extend((h + jit).tolist())
+                ex_y.extend(excess.tolist())
+                ex_h.extend([h] * int(pct.size))
+                raw_med.append(float(np.median(pct)))
+                raw_p25.append(float(np.percentile(pct, 25)))
+                raw_p75.append(float(np.percentile(pct, 75)))
+                ex_mean.append(float(np.mean(excess)))
+                ex_p25.append(float(np.percentile(excess, 25)))
+                ex_p75.append(float(np.percentile(excess, 75)))
+            else:
+                raw_med.append(np.nan)
+                raw_p25.append(np.nan)
+                raw_p75.append(np.nan)
+                ex_mean.append(np.nan)
+                ex_p25.append(np.nan)
+                ex_p75.append(np.nan)
+        hs = list(horizons)
+        show_legend = col == 1
+        layers = (
+            (1, raw_x, raw_y, raw_h, raw_p25, raw_p75, raw_med, base_med, raw_pct, "收益", False),
+            (2, ex_x, ex_y, ex_h, ex_p25, ex_p75, ex_mean, None, ex_pct, "超额", True),
+        )
+        for row, xs, ys, point_h, p25, p75, line_y, dash_y, cloud, value_name, is_excess in layers:
+            fig.add_trace(
+                go.Scatter(
+                    x=hs + hs[::-1],
+                    y=p75 + p25[::-1],
+                    fill="toself",
+                    fillcolor=band,
+                    line=dict(color="rgba(0,0,0,0)"),
+                    name="25%–75%",
+                    legendgroup="band",
+                    showlegend=show_legend and row == 1,
+                    hoverinfo="skip",
+                ),
+                row=row, col=col,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=xs, y=ys, mode="markers",
+                    marker=dict(size=5, color=color, opacity=0.45),
+                    name="单笔收益",
+                    legendgroup="pts",
+                    showlegend=show_legend and row == 1,
+                    hovertemplate=(
+                        f"持有 %{{customdata}} {unit} · {value_name} %{{y:.2f}}%<extra></extra>"
+                    ),
+                    customdata=point_h,
+                ),
+                row=row, col=col,
+            )
+            line_name = "超额平均" if is_excess else "信号中位数"
+            line_group = "alpha" if is_excess else "med"
+            fig.add_trace(
+                go.Scatter(
+                    x=hs, y=line_y, mode="lines",
+                    line=dict(color=color, width=2),
+                    name=line_name,
+                    legendgroup=line_group,
+                    showlegend=show_legend,
+                    hovertemplate=(
+                        f"持有 %{{x}} {unit} · {line_name} %{{y:.2f}}%<extra></extra>"
+                    ),
+                ),
+                row=row, col=col,
+            )
+            if dash_y is not None:
+                fig.add_trace(
+                    go.Scatter(
+                        x=hs, y=dash_y, mode="lines",
+                        line=dict(color="#78909c", width=1.4, dash="dash"),
+                        name="无条件中位数",
+                        legendgroup="base",
+                        showlegend=show_legend,
+                        hovertemplate=(
+                            f"持有 %{{x}} {unit} · 无条件中位 %{{y:.2f}}%<extra></extra>"
+                        ),
+                    ),
+                    row=row, col=col,
+                )
+            ylo, yhi = _posterior_strip_limits(cloud)
+            fig.add_hline(y=0, line_color="#9e9e9e", line_width=1, row=row, col=col)
+            fig.update_xaxes(
+                title_text=axis_title if row == 2 else "",
+                tickmode="array",
+                tickvals=tickvals,
+                range=[horizons[0] - 0.8, horizons[-1] + 0.8],
+                showgrid=False,
+                row=row, col=col,
+            )
+            fig.update_yaxes(
+                range=[ylo, yhi],
+                ticksuffix="%",
+                gridcolor="#e8e8e8",
+                zeroline=False,
+                row=row, col=col,
+            )
+        peak = peak_hold(hs, ex_mean)
+        if peak is not None:
+            for mark_row in (1, 2):
+                fig.add_vline(
+                    x=peak, line_width=1.2, line_dash="dot", line_color=color,
+                    row=mark_row, col=col,
+                )
+            fig.add_annotation(
+                x=peak, y=yhi, text=f"超额平均最高 · {peak} {unit}",
+                showarrow=False, yanchor="top",
+                font=dict(size=11, color=color),
+                bgcolor="rgba(255,255,255,0.85)",
+                row=2, col=col,
+            )
+    fig.update_layout(
+        height=920,
+        margin=dict(t=48, b=64, l=48, r=16),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        legend=dict(orientation="h", y=-0.06, x=0.5, xanchor="center"),
+    )
+    for ann in fig.layout.annotations:
+        text = ann.text or ""
+        ann.font.size = 11 if text.startswith("超额平均最高") else 13
+    return fig
+
+
 def process_ticker(ticker, out_dir, use_filter=USE_TREND_FILTER, ma_n=TREND_MA_N):
     df = add_indicators(load_ohlcv(ticker))
     bull_all, bear_all = compute_signals(df)               # 原始信号（不过滤）
@@ -1348,10 +1659,8 @@ def process_ticker(ticker, out_dir, use_filter=USE_TREND_FILTER, ma_n=TREND_MA_N
     if use_filter:
         bull_sig, bear_sig = apply_trend_filter(df, bull_all, bear_all,
                                                 ma_n=ma_n, mode="aligned")
-    fib = fib_levels(df)
-    rvp = rolling_volume_profile(df)                       # 新增
     chart_path = out_dir / f"{safe_chart_name(ticker)}.png"
-    plot_chart(df, ticker, bull_sig, bear_sig, fib, chart_path, rvp=rvp,
+    plot_chart(df, ticker, bull_sig, bear_sig, chart_path,
                bull_all=bull_all, bear_all=bear_all)
 
     # 新增：信号历史统计 + 后验分布图
@@ -1373,7 +1682,6 @@ def process_ticker(ticker, out_dir, use_filter=USE_TREND_FILTER, ma_n=TREND_MA_N
         "stats_bear": stats_bear,                          # 新增
         "bull_all": [(str(i.date()), int(v)) for i, v in bull_sig.items()],
         "bear_all": [(str(i.date()), int(v)) for i, v in bear_sig.items()],
-        "fib": {f"fib {r}": round(p, 2) for r, p in fib.items()},
         "recent": recent,
         "error": None,
     }

@@ -69,8 +69,6 @@ _TECHNICAL_SECTION = """## 技术面点评
 - 共振数
 - 滤波状态
 - 相对均线的位置
-- 斐波那契
-- POC、VAH、VAL
 - 该方向的 5/10/20 日后验
 """
 
@@ -104,18 +102,12 @@ def build_decision_prompt(
     filter_status,
     ma_note,
     adx_note,
-    fib_lines,
-    poc,
-    vah,
-    val,
     posterior,
 ):
     """用当前页已经算好的事实填一段给外部模型的研究 prompt。
 
     signal 为空表示近窗口没有顶/底背离，事实段会照实写「无」。
     """
-    fib_block = "\n".join(f"- {line}" for line in fib_lines) if fib_lines else "- 无"
-    vp = _vp_note(last_close, poc, vah, val)
     if signal:
         bias = "偏多，期望价格上涨" if signal == "底背离" else "偏空，期望价格下跌"
         change = _change_since(signal_close, last_close)
@@ -138,9 +130,6 @@ def build_decision_prompt(
 - 滤波状态：{filter_status}
 - 相对均线的位置：{ma_note}
 - ADX：{adx_note}
-- 斐波那契（相对最新收盘）：
-{fib_block}
-- POC、VAH、VAL：{vp}
 - 该方向的 5/10/20 日后验（入场是信号确认后的收盘；用来看这段历史里信号有没有超出行情本身，不是对这笔交易的预测）：
 {posterior}
 """
@@ -176,9 +165,6 @@ def build_decision_prompt(
 - 滤波状态：{filter_status}
 - 相对均线的位置：{ma_note}
 - ADX：{adx_note}
-- 斐波那契（相对最新收盘）：
-{fib_block}
-- POC、VAH、VAL：{vp}
 - 该方向的 5/10/20 日后验：无当前方向。下面是同一套参数的全样本历史，不是当前这一笔。
 {posterior}
 """
@@ -223,18 +209,3 @@ def _change_since(signal_close, last_close):
     if start == 0 or not math.isfinite(start) or not math.isfinite(float(last_close)):
         return "未计算"
     return _signed_pct(float(last_close) / start - 1)
-
-
-def _vp_note(last_close, poc, vah, val):
-    last = float(last_close)
-    if last > float(vah):
-        zone = "价值区上方"
-    elif last < float(val):
-        zone = "价值区下方"
-    else:
-        zone = "价值区内"
-    side = "上方" if last >= float(poc) else "下方"
-    return (
-        f"POC {_price(poc)}，VAH {_price(vah)}，VAL {_price(val)}。"
-        f"现价在{zone}，位于 POC {side}"
-    )

@@ -1,6 +1,6 @@
 # 多指标背离分析系统（TradingView 复刻 + 扩展）
 
-复刻并扩展了那张 TradingView 创业板指的图表思路：8 个技术指标的多指标共振背离检测 + 斐波那契回撤 + 布林带 + 滚动 Volume Profile，并在此基础上增加了**信号后验统计**、**数据缓存**、**趋势滤波（含 ADX）**、**交互式复盘 Dashboard**，以及一套**回测验证脚本**（参数网格 + 样本外验证）。
+复刻并扩展了那张 TradingView 创业板指的图表思路：8 个技术指标的多指标共振背离检测 + 布林带，并在此基础上增加了**信号后验统计**、**数据缓存**、**趋势滤波（含 ADX）**、**交互式复盘 Dashboard**，以及一套**回测验证脚本**（参数网格 + 样本外验证）。
 
 ## 文件结构
 
@@ -48,6 +48,12 @@ streamlit run dashboard.py
 
 注意：修改了 `tradingview_realization_v2.py` 后需重启 Streamlit（对 `sys.path` 导入的模块热重载不生效）。
 
+macOS 计划任务每天 07:00 和 18:10（本机时区）跑 `daily_update.py`：增量更新 `cache/` 里已有的行情，并按 Dashboard 侧边栏同一套规则找新背离。07:00 覆盖夜里收盘的美股，18:10 覆盖当天下午收盘的港股。第一次运行只记基线。之后的新信号写到 `cache/pending_grok_alert.txt`，由 Grok Bot 转发到对话；没有新信号则不发消息。日志在 `cache/daily_update.log`。手动跑一次：
+
+```bash
+.venv/bin/python daily_update.py
+```
+
 ## 可调参数详解
 
 所有参数集中在 `tradingview_realization_v2.py` 第 0 节，Dashboard 侧边栏可实时调节并联动重算。
@@ -75,14 +81,11 @@ streamlit run dashboard.py
 
 `adx(df, n=14)` 与 `apply_trend_filter(df, bull_sig, bear_sig, ma_n, mode, adx_th)` 在核心模块中，可直接复用。注意 ADX 的语义是"确认趋势强度"而非"抑制反向信号"——顺势模式下逆势信号本来就不保留。
 
-### 结构分析参数
+### 布林带
 
 | 参数 | 默认 | 作用 |
 |---|---|---|
-| `LOOKBACK` | 160 | **斐波那契取哪段波段**。对最近 N 根K线的高低点计算 0.236/0.382/0.5/0.618 回撤位。波段选择决定一切：选最近一波推动浪最合理；设 `None` 用整段数据适合看长期结构 |
-| `VP_WINDOW` | 60 | **滚动 Volume Profile 窗口**。第 t 天的 POC/VAH/VAL 只用过去 60 天数据计算，**无未来函数**，可直接当回测特征。调小 → 更贴近近期筹码；调大 → 更平滑稳定 |
-| `VP_BINS` | 40 | Volume Profile 的价格分档数。调大 → 档位更细、渲染更精细；调小 → 更概括 |
-| `BB_PERIOD` / `BB_STD` | 20 / 2.0 | 布林带周期/倍数。与背离配合使用：价格触及布林下轨 + 底背离共振，是经典的高胜率组合 |
+| `BB_PERIOD` / `BB_STD` | 20 / 2.0 | 布林带周期/倍数。与背离一起画在主图上 |
 
 ### 回测参数（backtest_divergence.py）
 
@@ -96,7 +99,7 @@ streamlit run dashboard.py
 
 | 参数 | 默认 | 作用 |
 |---|---|---|
-| `TICKERS` | SPY、USDJPY=X、KBE、USO、TLT、GLD、EEM、SOXX、1810.HK | 批处理标的列表。支持美股、外汇（USDJPY=X，⚠️ Yahoo 外汇成交量恒为 0，Volume Profile 会退化）、港股（1810.HK）、A 股指数（000001.SS，Yahoo 数据质量一般建议换 akshare） |
+| `TICKERS` | SPY、USDJPY=X、KBE、USO、TLT、GLD、EEM、SOXX、1810.HK | 批处理标的列表。支持美股、外汇（USDJPY=X）、港股（1810.HK）、A 股指数（000001.SS，Yahoo 数据质量一般建议换 akshare） |
 | `PERIOD` | 5y | 数据区间。**信号统计建议至少 5 年**，2 年数据去重后信号太少，统计结论不可靠；有缓存后增量更新很快 |
 | `SIGNAL_RECENT_DAYS` | 7 | "近 N 日信号"告警的截断窗口，输出到 `signals_recent.csv` |
 
@@ -104,7 +107,7 @@ streamlit run dashboard.py
 
 批处理每次运行生成一个以日期命名的目录（如 `2026-10-25/`）：
 
-- `{ticker}.png` — 主图：K线 + MA/VWMA + 布林带 + 斐波那契 + 滚动 POC/VA + 趋势背景 + 背离标注 + 右侧 Volume Profile
+- `{ticker}.png` — 主图：K线 + MA/VWMA + 布林带 + 趋势背景 + 背离标注
 - `returns_{ticker}.png` — 底/顶背离后验收益分布直方图（5/10/20 日三色）
 - `stats_{ticker}.csv` / `signal_stats_all.csv` — 单标的/跨标的信号后验统计表
 - `signals_recent.csv` — 近 7 日全标的信号告警
@@ -152,8 +155,6 @@ streamlit run dashboard.py
 
 - **背离信号**提示动量衰竭，适合减仓/收紧止损，**不要单独用来反手**；强趋势里会连续失效（回测已证实）
 - 趋势背景为绿色的区段，底背离的统计表现显著好于红色区段里的底背离（后者多半在接飞刀）
-- **VA 带**内运行 = 筹码平衡区；价格贴着带上/下沿运行并带动整条带迁移 = 趋势延续信号
-- **POC（控制点）** = 市场成本重心，价格在 POC 上方说明多数人浮盈，反之套牢
 - 后验统计表里**底背离胜率长期低于 50% 的标的**（如部分商品），信号应反着用或过滤掉
 ## 免责声明
 
