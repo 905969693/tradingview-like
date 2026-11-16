@@ -288,6 +288,16 @@ def td_sequential_counts(close, lookback=4, show_from=5):
     return pd.Series(up, index=index), pd.Series(down, index=index)
 
 
+def td_completed_nines(close, lookback=4):
+    """已经走完的九转。返回 (下跌九转, 上涨九转)。
+
+    索引是计数正好为 9 的那根 K 线。贴在样本末端、还没数到 9 的计数不会出现。
+    入场在下一根收盘，由调用方把 entry_shift 设为 1。
+    """
+    up, down = td_sequential_counts(close, lookback=lookback)
+    return down[down == 9], up[up == 9]
+
+
 def find_divergences(df, ind, order=PIVOT_ORDER):
     lows = _swing_points(df.Low.values, np.less, order)
     highs = _swing_points(df.High.values, np.greater, order)
@@ -301,6 +311,83 @@ def find_divergences(df, ind, order=PIVOT_ORDER):
                 if df.High.iat[a] < df.High.iat[b] and ind.iat[a] > ind.iat[b]:
                     out.append(b)
     return bull, bear
+
+
+def _signal_positions(df, sig):
+    """信号索引在 df 里的位置。缺失的时间戳丢掉。"""
+    if sig is None or len(sig) == 0:
+        return np.array([], dtype=int)
+    pos = df.index.get_indexer(sig.index)
+    return pos[pos >= 0]
+
+
+def confirmed_nine_overlap_pairs(df, div_sig, nine_sig, pivot_order):
+    """九转第 7、8、9 根和背离点左右各 pivot_order 根的每一对重合。
+
+    返回列 pivot、nine、entry。entry 是较晚的一根：九转第 9 根，或背离确认的最后一根。
+    pivot_order 用调用方传入的数。
+    """
+    empty = pd.DataFrame(columns=["pivot", "nine", "entry"])
+    nine_at = _signal_positions(df, nine_sig)
+    div_at = _signal_positions(df, div_sig)
+    if nine_at.size == 0 or div_at.size == 0:
+        return empty
+    order = int(pivot_order)
+    n = len(df)
+    rows = []
+    for today in nine_at:
+        today = int(today)
+        if today < 2:
+            continue
+        nine_bars = (today - 2, today - 1, today)
+        for pivot in div_at:
+            pivot = int(pivot)
+            left = pivot - order
+            right = pivot + order
+            if right >= n or not any(left <= bar <= right for bar in nine_bars):
+                continue
+            rows.append({
+                "pivot": df.index[pivot],
+                "nine": df.index[today],
+                "entry": df.index[max(today, right)],
+            })
+    if not rows:
+        return empty
+    return pd.DataFrame(rows)
+
+
+def confirmed_nine_overlap(df, div_sig, nine_sig, pivot_order):
+    """重合的入场 bar。同一根入场只保留一次，调用方把 entry_shift 设为 0。"""
+    pairs = confirmed_nine_overlap_pairs(df, div_sig, nine_sig, pivot_order)
+    if pairs.empty:
+        return pd.Series(dtype=float)
+    entry_idx = pd.DatetimeIndex(pairs["entry"]).unique().sort_values()
+    return pd.Series(1, index=entry_idx)
+
+
+def _naive_timestamp(value):
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    return ts
+
+
+def nine_overlap_note(pairs, pivot_ts, pivot_order):
+    """这条背离若参与了九转配合，返回说明；否则返回空字符串。"""
+    if pairs is None or len(pairs) == 0:
+        return ""
+    day = _naive_timestamp(pivot_ts).normalize()
+    pivots = pd.DatetimeIndex(pd.to_datetime(pairs["pivot"]).map(_naive_timestamp)).normalize()
+    hit = pairs.loc[pivots == day]
+    if hit.empty:
+        return ""
+    entry = _naive_timestamp(hit["entry"].iloc[-1])
+    return (
+        f"九转配合已确认背离：计数 7、8、9 与该背离点左右各 {int(pivot_order)} 根重合。"
+        f"入场 {entry.date().isoformat()}，取较晚的一根收盘"
+        "（九转第 9 根，或背离确认的最后一根）。"
+        "这是对这条已确认背离的加强。"
+    )
 
 
 def dedup_signals(signals, df, gap=DEDUP_BARS):
@@ -728,6 +815,53 @@ def signal_stats(
     return pd.DataFrame(rows)
 
 
+def conjunction_compare_table(
+    df,
+    joint_sig,
+    nine_sig,
+    div_sig,
+    short=False,
+    joint_shift=0,
+    nine_shift=1,
+    div_shift=PIVOT_ORDER,
+    horizons=STATS_HORIZONS,
+    daily_df=None,
+    horizon_count_daily=False,
+    signal_timeframe="daily",
+):
+    """共振的信号数、胜率、中位收益，并排单独九转和单独已确认背离的中位收益。"""
+    kw = dict(
+        horizons=horizons,
+        short=short,
+        daily_df=daily_df,
+        horizon_count_daily=horizon_count_daily,
+        signal_timeframe=signal_timeframe,
+    )
+    nine = signal_stats(df, nine_sig, entry_shift=nine_shift, **kw)
+    div = signal_stats(df, div_sig, entry_shift=div_shift, **kw)
+    nine_med = nine["中位收益"].where(nine["信号数"] > 0)
+    div_med = div["中位收益"].where(div["信号数"] > 0)
+    if joint_sig is None or len(joint_sig) == 0:
+        return pd.DataFrame({
+            "持有期": nine["持有期"],
+            "共振信号数": 0,
+            "共振胜率": np.nan,
+            "共振中位收益": np.nan,
+            "九转中位收益": nine_med,
+            "背离中位收益": div_med,
+        })
+    joint = signal_stats(df, joint_sig, entry_shift=joint_shift, **kw)
+    counted = joint["信号数"] > 0
+    return pd.DataFrame({
+        "持有期": joint["持有期"],
+        "共振信号数": joint["信号数"],
+        "共振胜率": joint["胜率"].where(counted),
+        "共振中位收益": joint["中位收益"].where(counted),
+        "九转中位收益": nine_med,
+        "背离中位收益": div_med,
+    })
+
+
 def unconditional_returns(
     df,
     horizon,
@@ -800,6 +934,8 @@ def unconditional_stats(
 # 收缩超额胜率。样本少于大约 10 笔时只计入一部分。10 是笔数，不是持有天数。
 EDGE_PRIOR_N = 10
 EDGE_Z90 = 1.64
+# 曲线中位数换算成百分点后，相差不足 1 个点视为并列。
+METHOD_CURVE_TIE = 0.01
 
 
 def edge_score(win_rate, base_rate, n, prior_n=EDGE_PRIOR_N):
@@ -960,6 +1096,196 @@ def curve_median_edge(curve):
     if finite.size == 0:
         return np.nan
     return float(np.median(finite))
+
+
+def _median_finite(values):
+    arr = np.asarray(list(values), dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.nan
+    return float(np.median(finite))
+
+
+def method_side_metrics(
+    df,
+    sig,
+    short=False,
+    entry_shift=0,
+    horizons=POSTERIOR_SPAN,
+    daily_df=None,
+    horizon_count_daily=False,
+):
+    """一条信号在一个方向上的挑选用数。
+
+    曲线中位数是 3–40 根收缩超额胜率的中位数。
+    下界中位数是同一段里每一根超额胜率的 90% 下界再取中位数。
+    笔数是这段里最短持有期还能出场的信号数，默认就是持有 3 根。
+    """
+    curve = hold_edge_curve(
+        df, sig, horizons=horizons, entry_shift=entry_shift, short=short,
+        daily_df=daily_df, horizon_count_daily=horizon_count_daily,
+    )
+    empty = {"n": 0, "curve": np.nan, "lower": np.nan}
+    if curve is None or curve.empty:
+        return empty
+    lowers = [
+        edge_lower_bound(win, base, int(n) if np.isfinite(n) else 0)
+        for win, base, n in zip(
+            curve["胜率"].to_numpy(dtype=float),
+            curve["无条件胜率"].to_numpy(dtype=float),
+            curve["信号数"].to_numpy(dtype=float),
+        )
+    ]
+    first = int(tuple(horizons)[0])
+    counted = curve.loc[curve["持有根数"] == first, "信号数"]
+    n_out = int(counted.iloc[0]) if len(counted) and np.isfinite(counted.iloc[0]) else 0
+    return {
+        "n": n_out,
+        "curve": curve_median_edge(curve),
+        "lower": _median_finite(lowers),
+    }
+
+
+def _method_clears(metrics):
+    lower = metrics.get("lower", np.nan) if metrics else np.nan
+    return bool(np.isfinite(lower) and float(lower) > 0)
+
+
+def _pick_primary(div_metrics, nine_metrics):
+    """下界中位数大于 0 才有资格。都过线时比曲线中位数，相差不足 1 个点时比笔数。"""
+    div_ok = _method_clears(div_metrics)
+    nine_ok = _method_clears(nine_metrics)
+    if not div_ok and not nine_ok:
+        return "none"
+    if div_ok and not nine_ok:
+        return "divergence"
+    if nine_ok and not div_ok:
+        return "nine"
+    div_curve = float(div_metrics["curve"])
+    nine_curve = float(nine_metrics["curve"])
+    div_finite = np.isfinite(div_curve)
+    nine_finite = np.isfinite(nine_curve)
+    if div_finite and nine_finite and abs(div_curve - nine_curve) < METHOD_CURVE_TIE:
+        div_n = int(div_metrics["n"])
+        nine_n = int(nine_metrics["n"])
+        if div_n != nine_n:
+            return "divergence" if div_n > nine_n else "nine"
+        return "divergence" if div_curve >= nine_curve else "nine"
+    if div_finite and (not nine_finite or div_curve > nine_curve):
+        return "divergence"
+    if nine_finite and (not div_finite or nine_curve > div_curve):
+        return "nine"
+    div_n = int(div_metrics["n"])
+    nine_n = int(nine_metrics["n"])
+    return "divergence" if div_n >= nine_n else "nine"
+
+
+def choose_methods(
+    div_long, div_short,
+    nine_long, nine_short,
+    overlap_long, overlap_short,
+    long_only=False,
+):
+    """每个方向在背离和九转里选主方法。共振只标记能否加仓，不参与竞选。
+
+    只做多时做空仍保留算出来的数，adopted 为 False，调用方把判定写成不采用。
+    """
+    def one_side(div_metrics, nine_metrics, overlap_metrics, adopted):
+        return {
+            "primary": _pick_primary(div_metrics, nine_metrics),
+            "adopted": bool(adopted),
+            "addon": _method_clears(overlap_metrics),
+            "divergence": div_metrics,
+            "nine": nine_metrics,
+            "overlap": overlap_metrics,
+        }
+
+    return {
+        "long": one_side(div_long, nine_long, overlap_long, True),
+        "short": one_side(div_short, nine_short, overlap_short, not long_only),
+    }
+
+
+def evaluate_method_choice(
+    df, div_long, div_short, pivot_order, *,
+    long_only=False, daily_df=None, horizon_count_daily=False,
+    horizons=POSTERIOR_SPAN,
+):
+    """用当前保留的背离、不过滤的九转，以及二者的已确认重合，选出主方法和加仓。"""
+    down, up = td_completed_nines(df.Close)
+    overlap_long = confirmed_nine_overlap(df, div_long, down, pivot_order)
+    overlap_short = confirmed_nine_overlap(df, div_short, up, pivot_order)
+    kw = dict(
+        daily_df=daily_df,
+        horizon_count_daily=horizon_count_daily,
+        horizons=horizons,
+    )
+    return choose_methods(
+        method_side_metrics(df, div_long, short=False, entry_shift=pivot_order, **kw),
+        method_side_metrics(df, div_short, short=True, entry_shift=pivot_order, **kw),
+        method_side_metrics(df, down, short=False, entry_shift=1, **kw),
+        method_side_metrics(df, up, short=True, entry_shift=1, **kw),
+        method_side_metrics(df, overlap_long, short=False, entry_shift=0, **kw),
+        method_side_metrics(df, overlap_short, short=True, entry_shift=0, **kw),
+        long_only=long_only,
+    )
+
+
+def method_primary_label(side):
+    """做多/做空主方法的短名。未采用的一侧写不采用。"""
+    if not side or not side.get("adopted"):
+        return "不采用"
+    return {"divergence": "背离", "nine": "九转"}.get(side.get("primary"), "没有可用优势")
+
+
+def method_addon_label(side):
+    """共振是否加仓。未采用的一侧写不采用。"""
+    if not side or not side.get("adopted"):
+        return "不采用"
+    return "加仓" if side.get("addon") else "不加仓"
+
+
+def method_choice_summary(choice):
+    """一句话：两侧主方法，以及共振是加仓还是不加仓。"""
+    return (
+        f"做多主方法：{method_primary_label(choice['long'])}。"
+        f"做空主方法：{method_primary_label(choice['short'])}。"
+        f"共振：做多{method_addon_label(choice['long'])}，做空{method_addon_label(choice['short'])}。"
+    )
+
+
+def method_verdict(side, method):
+    """表里的判定。method 是 divergence、nine 或 overlap。"""
+    if not side or not side.get("adopted"):
+        return "不采用"
+    if method == "overlap":
+        return "加仓" if side.get("addon") else "不加仓"
+    if side.get("primary") == method:
+        return "主方法"
+    metrics = side.get(method) or {}
+    if _method_clears(metrics):
+        return "过线"
+    return "未过下界"
+
+
+def method_signal_note(choice, side_name, kind):
+    """一条信号上的说明。kind 是 divergence、nine 或 overlap。"""
+    side = choice.get(side_name) or {}
+    if not side.get("adopted"):
+        return "该标的只做多，这一侧不采用。"
+    if kind == "nine":
+        if side.get("primary") == "nine":
+            return "这是该方向的主方法。入场是下一根收盘。"
+        return ""
+    if kind == "overlap":
+        if side.get("addon"):
+            return "下界中位数为正，按加仓看，不替换主方法。"
+        return "下界中位数不大于 0，只标记，不加仓。"
+    if side.get("primary") == "divergence":
+        return "这条是该方向的主方法。"
+    if side.get("primary") == "nine":
+        return "这条背离不是该方向的主方法，主方法是九转。"
+    return "该方向没有通过下界的主方法。"
 
 
 def peak_hold(horizons, values):
@@ -1365,30 +1691,33 @@ def posterior_returns_plotly(
     daily_df=None,
     horizon_count_daily=False,
     signal_timeframe="daily",
+    long_name="底背离",
+    short_name="顶背离",
 ):
     """Dashboard 用的后验收益图。
 
     持有期不超过 5 档时是分组散点。更长的序列（如 3 到 40）画成两行：
     上行是原始收益，下行每笔减去同一持有期、同一方向的无条件平均。
+    long_name / short_name 只改标题，默认仍是顶底背离。
     """
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-
     horizons = tuple(int(h) for h in horizons)
     if len(horizons) <= 5:
         return _posterior_strip_plotly(
             df, bull_sig, bear_sig, entry_shift, horizons,
             daily_df, horizon_count_daily, signal_timeframe,
+            long_name, short_name,
         )
     return _posterior_span_plotly(
         df, bull_sig, bear_sig, entry_shift, horizons,
         daily_df, horizon_count_daily, signal_timeframe,
+        long_name, short_name,
     )
 
 
 def _posterior_strip_plotly(
     df, bull_sig, bear_sig, entry_shift, horizons,
     daily_df, horizon_count_daily, signal_timeframe,
+    long_name="底背离", short_name="顶背离",
 ):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -1407,7 +1736,7 @@ def _posterior_strip_plotly(
     ]
     fig = make_subplots(
         rows=1, cols=2,
-        subplot_titles=("底背离后验", "顶背离后验"),
+        subplot_titles=(f"{long_name}后验", f"{short_name}后验"),
         horizontal_spacing=0.08,
     )
     panels = [
@@ -1473,6 +1802,7 @@ def _posterior_strip_plotly(
 def _posterior_span_plotly(
     df, bull_sig, bear_sig, entry_shift, horizons,
     daily_df, horizon_count_daily, signal_timeframe,
+    long_name="底背离", short_name="顶背离",
 ):
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
@@ -1487,10 +1817,10 @@ def _posterior_span_plotly(
     fig = make_subplots(
         rows=2, cols=2,
         subplot_titles=(
-            "底背离后验（未扣无条件平均）",
-            "顶背离后验（未扣无条件平均）",
-            "底背离后验（已扣无条件平均）",
-            "顶背离后验（已扣无条件平均）",
+            f"{long_name}后验（未扣无条件平均）",
+            f"{short_name}后验（未扣无条件平均）",
+            f"{long_name}后验（已扣无条件平均）",
+            f"{short_name}后验（已扣无条件平均）",
         ),
         horizontal_spacing=0.08,
         vertical_spacing=0.14,

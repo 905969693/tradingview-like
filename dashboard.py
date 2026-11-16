@@ -602,6 +602,23 @@ def _format_stats_table(stats_df):
     return out
 
 
+def _format_conjunction_table(table):
+    """共振对照表：胜率与中位收益以百分比展示。"""
+    out = table.set_index("持有期").copy()
+    if "共振胜率" in out.columns:
+        out["共振胜率"] = out["共振胜率"].map(
+            lambda x: "" if pd.isna(x) else f"{float(x) * 100:.1f}%"
+        )
+    for col in ("共振中位收益", "九转中位收益", "背离中位收益"):
+        if col in out.columns:
+            out[col] = out[col].map(
+                lambda x: "" if pd.isna(x) else f"{float(x) * 100:+.2f}%"
+            )
+    if "共振信号数" in out.columns:
+        out["共振信号数"] = out["共振信号数"].astype("Int64")
+    return out
+
+
 @st.cache_data(show_spinner=False)
 def compute_all(
     df, pivot_order, min_count, dedup_bars, ma_n, adx_th,
@@ -1212,13 +1229,31 @@ def scan_recent_signals(
                 )
             sigs = tv.signals_in_window(bull, bear, d, t, days=days)
             if sigs:
+                down_n, up_n = tv.td_completed_nines(d.Close)
+                long_pairs = tv.confirmed_nine_overlap_pairs(d, bull, down_n, po)
+                short_pairs = tv.confirmed_nine_overlap_pairs(d, bear, up_n, po)
                 latest = sorted(sigs, key=lambda x: x["date"], reverse=True)[0]
+                latest_pairs = long_pairs if latest["signal"] == "底背离" else short_pairs
+                latest_note = tv.nine_overlap_note(latest_pairs, latest["date"], po)
+                any_note = False
+                for one in sigs:
+                    one_pairs = long_pairs if one["signal"] == "底背离" else short_pairs
+                    if tv.nine_overlap_note(one_pairs, one["date"], po):
+                        any_note = True
+                        break
+                if latest_note:
+                    nine_col = "这一条是"
+                elif any_note:
+                    nine_col = "窗口内有"
+                else:
+                    nine_col = "—"
                 rows.append({
                     "ticker": t,
                     "最新信号": latest["signal"],
                     "日期": latest["date"],
                     "共振数": latest["indicator_count"],
                     "信号数(窗口内)": len(sigs),
+                    "九转配合": nine_col,
                 })
         except Exception:
             continue  # 某个标的拉取失败不阻塞整体扫描
@@ -1234,6 +1269,7 @@ with st.sidebar.expander(f"🔔 近{recent_window_label}有信号的标的", exp
     if scan.empty:
         st.success(f"近 {recent_window_label} 全部标的无背离信号")
     else:
+        st.caption("「九转配合」为「这一条是」表示最新信号同时满足九转第 7、8、9 根与背离点重合；「窗口内有」表示近窗口里另有一条满足。")
         # 底背离绿、顶背离红，便于一眼区分
         def _color(sig):
             return "color: #26a69a" if sig == "底背离" else "color: #ef5350"
@@ -1241,6 +1277,81 @@ with st.sidebar.expander(f"🔔 近{recent_window_label}有信号的标的", exp
             scan.sort_values("日期", ascending=False).style.map(
                 lambda s: _color(s), subset=["最新信号"]),
             width="stretch", hide_index=True,
+        )
+
+
+@st.cache_data(ttl="15m", max_entries=8, show_spinner=False)
+def method_choice_rows(
+    tickers_tuple, period, pivot_order, min_count, dedup_bars, preset_rev, data_rev,
+    _dedup_rev=tv.DEDUP_LOGIC_REV,
+):
+    """每个标的的主方法。信号和近窗扫描同一套：固定参数，开了趋势滤波就用滤波后的背离。"""
+    del data_rev, _dedup_rev
+    rows = []
+    for name in tickers_tuple:
+        try:
+            po, mc, gap, use_filter, mode, adx_i, ma_i, long_only = _params_for(
+                name, pivot_order, min_count, dedup_bars, preset_rev,
+            )
+            data = tv.add_indicators(tv.load_ohlcv(name, period=period))
+            bull_s = pd.Series(0, index=data.index)
+            bear_s = pd.Series(0, index=data.index)
+            for ind in tv.INDICATORS:
+                b_idx, r_idx = tv.find_divergences(data, data[ind], order=po)
+                bull_s.iloc[b_idx] += 1
+                bear_s.iloc[r_idx] += 1
+            bull = tv.dedup_signals(bull_s[bull_s >= mc], data, gap=gap)
+            bear = tv.dedup_signals(bear_s[bear_s >= mc], data, gap=gap)
+            if use_filter:
+                bull, bear = tv.apply_trend_filter(
+                    data, bull, bear, ma_n=ma_i, mode=mode, adx_th=adx_i,
+                )
+            choice = tv.evaluate_method_choice(
+                data, bull, bear, po, long_only=bool(long_only),
+            )
+            addon_bits = []
+            if choice["long"]["adopted"] and choice["long"]["addon"]:
+                addon_bits.append("做多")
+            if choice["short"]["adopted"] and choice["short"]["addon"]:
+                addon_bits.append("做空")
+            rows.append({
+                "标的": name,
+                "做多主方法": tv.method_primary_label(choice["long"]),
+                "做空主方法": tv.method_primary_label(choice["short"]),
+                "共振加仓": "、".join(addon_bits) if addon_bits else "—",
+            })
+        except Exception:
+            rows.append({
+                "标的": name,
+                "做多主方法": "失败",
+                "做空主方法": "失败",
+                "共振加仓": "—",
+            })
+    return pd.DataFrame(rows)
+
+
+_method_list = st.sidebar.expander("各标的主方法", on_change="rerun")
+if _method_list.open:
+    with _method_list:
+        st.caption(
+            "与上面的近窗扫描同一套日线和固定参数。"
+            "主方法只在背离和九转之间产生，持有 3–40 根的下界中位数大于 0 才过线。"
+            "共振加仓不替换主方法。这是全样本比较，换一段行情可能换方法。"
+        )
+        _method_list_rows = method_choice_rows(
+            tuple(tickers),
+            period,
+            pivot_order,
+            min_count,
+            dedup_bars,
+            _preset_cache_key(),
+            st.session_state.get("price_cache_nonce", 0),
+        )
+        st.dataframe(
+            _method_list_rows,
+            width="stretch",
+            hide_index=True,
+            alt="各标的做多、做空主方法，以及共振是否加仓",
         )
 
 dual_scan_days = max(recent_window_days, 42)
@@ -1468,6 +1579,67 @@ if len(r_drop):
         marker=dict(symbol="triangle-down-open", size=12, color="#6a1b9a"),
         name="顶背离(已过滤)"), row=1, col=1)
 
+_td_completed_dn, _td_completed_up = tv.td_completed_nines(df.Close)
+_overlap_long_pairs = tv.confirmed_nine_overlap_pairs(
+    df, bull_sig, _td_completed_dn, pivot_order,
+)
+_overlap_short_pairs = tv.confirmed_nine_overlap_pairs(
+    df, bear_sig, _td_completed_up, pivot_order,
+)
+_overlap_long = tv.confirmed_nine_overlap(df, bull_sig, _td_completed_dn, pivot_order)
+_overlap_short = tv.confirmed_nine_overlap(df, bear_sig, _td_completed_up, pivot_order)
+
+
+def _chart_overlap(sig):
+    if sig is None or len(sig) == 0:
+        return sig
+    return sig[sig.index >= chart_start]
+
+
+def _mark_nine_overlap(sig, bullish):
+    visible = _chart_overlap(sig)
+    if visible is None or len(visible) == 0:
+        return
+    label = "九转∩底" if bullish else "九转∩顶"
+    color = "#00E5FF" if bullish else "#FFD600"
+    price = df.Low if bullish else df.High
+    scale = 0.955 if bullish else 1.045
+    ay = 48 if bullish else -48
+    y = price.reindex(visible.index) * scale
+    fig.add_trace(go.Scatter(
+        x=visible.index,
+        y=y,
+        mode="markers",
+        marker=dict(
+            symbol="star",
+            size=30,
+            color=color,
+            line=dict(color="#000000", width=2),
+        ),
+        name=f"九转配合{'底' if bullish else '顶'}背离",
+        hovertemplate=(
+            "九转配合已确认背离<br>%{x|%Y-%m-%d} 入场"
+            "<extra></extra>"
+        ),
+    ), row=1, col=1)
+    for ts, yy in y.items():
+        fig.add_annotation(
+            x=ts,
+            y=float(yy),
+            text=label,
+            showarrow=False,
+            font=dict(size=15, color="#000000"),
+            bgcolor=color,
+            bordercolor="#000000",
+            borderwidth=2,
+            borderpad=3,
+            yshift=ay,
+        )
+
+
+_mark_nine_overlap(_overlap_long, True)
+_mark_nine_overlap(_overlap_short, False)
+
 fig.update_layout(
     title=f"{ticker} [{timeframe}] 背离 + 布林带",
     xaxis_rangeslider_visible=False,
@@ -1543,6 +1715,12 @@ st.plotly_chart(
     key=_main_chart_key,
     on_select="ignore",
     config=_plot_cfg,
+)
+_n_overlap_vis = len(_chart_overlap(_overlap_long)) + len(_chart_overlap(_overlap_short))
+st.caption(
+    "大号星标是九转配合已确认背离的入场，和普通三角不是同一种标记。"
+    f"九转用计数 7、8、9，背离点左右各 {pivot_order} 根，入场取较晚的一根收盘。"
+    f" 这张图上有 {_n_overlap_vis} 个。"
 )
 
 if _measure_on and _mstats is not None:
@@ -1704,6 +1882,203 @@ with tab_filt:
         panel_key="filtered",
     )
 
+st.subheader("九转后验")
+if is_weekly:
+    _td_when = "第九根周 K 成立后，下一根周 K 的收盘"
+else:
+    _td_when = "第九根日 K 成立后，下一根日 K 的收盘"
+st.caption(
+    f"下跌九转在{_td_when}买入；上涨九转在同一根收盘做空。"
+    "只计已经走完的完整 9，贴在最后一根、还没数到 9 的不计。"
+    f"表的持有期、胜率和无条件对照与上面的背离后验相同。{hold_caption}"
+)
+_td_long, _td_short = tv.td_completed_nines(df.Close)
+_td_kw = dict(_stats_kw)
+_td_kw["entry_shift"] = 1
+_td_long_stats = _attach_unconditional(
+    tv.signal_stats(df, _td_long, short=False, **_td_kw), base_long,
+)
+_td_short_stats = _attach_unconditional(
+    tv.signal_stats(df, _td_short, short=True, **_td_kw), base_short,
+)
+_td_col_l, _td_col_r = st.columns(2)
+with _td_col_l:
+    st.markdown("**下跌九转（买入）**")
+    st.dataframe(
+        _format_stats_table(_td_long_stats), width="stretch",
+        alt="下跌九转后验统计", key="td_long_stats",
+    )
+with _td_col_r:
+    st.markdown("**上涨九转（做空）**")
+    st.dataframe(
+        _format_stats_table(_td_short_stats), width="stretch",
+        alt="上涨九转后验统计", key="td_short_stats",
+    )
+_td_long_curve = tv.hold_edge_curve(
+    df, _td_long, short=False, horizons=tv.POSTERIOR_SPAN,
+    entry_shift=1,
+    daily_df=_stats_kw["daily_df"],
+    horizon_count_daily=_stats_kw["horizon_count_daily"],
+)
+_td_short_curve = tv.hold_edge_curve(
+    df, _td_short, short=True, horizons=tv.POSTERIOR_SPAN,
+    entry_shift=1,
+    daily_df=_stats_kw["daily_df"],
+    horizon_count_daily=_stats_kw["horizon_count_daily"],
+)
+_td_long_peak = tv.curve_peak_hold(_td_long_curve)
+_td_short_peak = tv.curve_peak_hold(_td_short_curve)
+_td_unit = (
+    "个交易日" if _stats_kw["horizon_count_daily"] else ("周" if is_weekly else "根")
+)
+_td_long_peak_text = f"{_td_long_peak} {_td_unit}" if _td_long_peak else "—"
+_td_short_peak_text = f"{_td_short_peak} {_td_unit}" if _td_short_peak else "—"
+st.caption(
+    f"下跌九转 {len(_td_long)} 次，上涨九转 {len(_td_short)} 次。"
+    f"下跌九转尖峰 {_td_long_peak_text}，上涨九转尖峰 {_td_short_peak_text}。"
+    "上排未扣无条件平均：实线是信号中位数，灰虚线是无条件中位数。"
+    "下排已扣无条件平均：每笔减去同一持有期、同一方向的无条件平均，0 轴表示没有超出这段行情本身。"
+)
+fig_td = tv.posterior_returns_plotly(
+    df, _td_long, _td_short,
+    horizons=tv.POSTERIOR_SPAN,
+    long_name="下跌九转",
+    short_name="上涨九转",
+    **_td_kw,
+)
+st.plotly_chart(
+    fig_td, width="stretch", alt="九转信号后验收益分布",
+    key="td_posterior",
+)
+
+_conj_kw = dict(
+    daily_df=_stats_kw["daily_df"],
+    horizon_count_daily=_stats_kw["horizon_count_daily"],
+    signal_timeframe=_stats_kw["signal_timeframe"],
+)
+
+
+def _render_conjunction(title, caption, long_sig, short_sig, long_name, short_name,
+                        entry_shift, panel_key):
+    st.subheader(title)
+    st.caption(caption)
+    long_table = tv.conjunction_compare_table(
+        df, long_sig, _td_long, bull_sig, short=False,
+        joint_shift=entry_shift, nine_shift=1, div_shift=pivot_order, **_conj_kw,
+    )
+    short_table = tv.conjunction_compare_table(
+        df, short_sig, _td_short, bear_sig, short=True,
+        joint_shift=entry_shift, nine_shift=1, div_shift=pivot_order, **_conj_kw,
+    )
+    st.caption(
+        f"{long_name} {len(long_sig)} 次，{short_name} {len(short_sig)} 次。"
+        "表里的共振信号数只计还能持满的笔。九转中位收益、背离中位收益是单独信号，不是交集。"
+    )
+    col_l, col_r = st.columns(2)
+    with col_l:
+        st.markdown(f"**{long_name}（买入）**")
+        st.dataframe(
+            _format_conjunction_table(long_table), width="stretch",
+            alt=f"{long_name}胜率与中位收益", key=f"{panel_key}_long_table",
+        )
+    with col_r:
+        st.markdown(f"**{short_name}（做空）**")
+        st.dataframe(
+            _format_conjunction_table(short_table), width="stretch",
+            alt=f"{short_name}胜率与中位收益", key=f"{panel_key}_short_table",
+        )
+    fig_joint = tv.posterior_returns_plotly(
+        df, long_sig, short_sig,
+        horizons=tv.POSTERIOR_SPAN,
+        long_name=long_name,
+        short_name=short_name,
+        entry_shift=entry_shift,
+        **_conj_kw,
+    )
+    st.plotly_chart(
+        fig_joint, width="stretch", alt=f"{title}后验收益分布",
+        key=f"{panel_key}_posterior",
+    )
+
+
+_bar_name = "周" if is_weekly else "日"
+_render_conjunction(
+    "九转配合已确认背离",
+    "配合测试，不替换上面的背离信号。"
+    f"九转用计数 7、8、9 这三根{_bar_name} K，"
+    f"背离点左右各 {pivot_order} 根{_bar_name} K。"
+    "两边有重合就记一次。"
+    f"入场是较晚的一根收盘：九转第 9 根，或背离确认的最后一根"
+    f"（摆动点后再数 {pivot_order} 根）。"
+    f" 持有期与上面相同。{hold_caption}",
+    _overlap_long, _overlap_short,
+    "下跌九转∩底背离", "上涨九转∩顶背离",
+    entry_shift=0, panel_key="overlap",
+)
+
+_method_choice = tv.evaluate_method_choice(
+    df, bull_plot, bear_plot, pivot_order,
+    long_only=long_only,
+    daily_df=_stats_kw["daily_df"],
+    horizon_count_daily=_stats_kw["horizon_count_daily"],
+)
+if _stats_kw["horizon_count_daily"]:
+    _method_unit = "个交易日"
+elif is_weekly:
+    _method_unit = "周"
+else:
+    _method_unit = "根"
+
+
+def _method_side_frame(side_key):
+    side = _method_choice[side_key]
+    rows = []
+    for key, label in (
+        ("divergence", "背离"),
+        ("nine", "九转"),
+        ("overlap", "九转配合已确认背离"),
+    ):
+        metrics = side[key]
+        rows.append({
+            "方法": label,
+            "笔数": int(metrics["n"]),
+            "曲线中位数": _fmt_edge_points(metrics["curve"]) or "—",
+            "下界中位数": _fmt_edge_points(metrics["lower"]) or "—",
+            "判定": tv.method_verdict(side, key),
+        })
+    return pd.DataFrame(rows)
+
+
+st.subheader("方法选择")
+st.markdown(f"**{tv.method_choice_summary(_method_choice)}**")
+st.caption(
+    f"曲线中位数和下界中位数都来自持有 {_span} {_method_unit}，不是某一天。"
+    "曲线中位数是收缩超额胜率的中位数，单位是百分点。"
+    "下界中位数是每一根超额胜率的 90% 下界再取中位数，大于 0 才过线。"
+    "背离用当前图上保留的信号，开了趋势滤波就是滤波后的。九转不过滤。"
+    "两侧都过线时，曲线中位数更高的一侧是主方法；相差不足 1 个点时，取笔数更多的一侧。"
+    "过线表示下界中位数大于 0，但不是这一侧的主方法。"
+    "共振不参与主方法竞选。只做多时，做空判定写成不采用。"
+    "这是全样本内的比较，换一段行情主方法可能换。"
+)
+_method_col_l, _method_col_r = st.columns(2)
+with _method_col_l:
+    st.markdown("**买入**")
+    st.dataframe(
+        _method_side_frame("long"),
+        width="stretch",
+        hide_index=True,
+        alt="买入方向的背离、九转和共振谁是主方法",
+    )
+with _method_col_r:
+    st.markdown("**做空**")
+    st.dataframe(
+        _method_side_frame("short"),
+        width="stretch",
+        hide_index=True,
+        alt="做空方向的背离、九转和共振谁是主方法",
+    )
+
 recent = pd.DataFrame(
     tv.signals_in_window(
         bull_plot, bear_plot, df, ticker, days=recent_window_days
@@ -1778,6 +2153,7 @@ def _prompt_for_signal_row(row):
         filter_status = "逆势保留"
     else:
         filter_status = "顺势保留"
+    nine_note = _nine_note_for_signal(row["signal"], row["date"])
     return dp.build_decision_prompt(
         ticker=ticker,
         timeframe=timeframe,
@@ -1792,6 +2168,8 @@ def _prompt_for_signal_row(row):
         ma_note=_ma_note_at(bar, "信号日"),
         adx_note=_adx_note_at(bar, "信号日"),
         posterior=_posterior_text(row["signal"]),
+        nine_note=nine_note,
+        method_note=_method_note_for_signal(row["signal"], not nine_note.startswith("无")),
     )
 
 
@@ -1826,14 +2204,75 @@ def _prompt_without_signal():
         ma_note=_ma_note_at(bar, "最新"),
         adx_note=_adx_note_at(bar, "最新"),
         posterior=posterior,
+        nine_note=_nine_note_in_window(),
+        method_note=tv.method_choice_summary(_method_choice),
+    )
+
+
+def _method_note_for_signal(signal_name, has_overlap):
+    """这条背离是不是主方法；若同时是九转配合，接着写加仓还是只标记。"""
+    side = "long" if signal_name == "底背离" else "short"
+    text = tv.method_signal_note(_method_choice, side, "divergence")
+    if has_overlap:
+        text += tv.method_signal_note(_method_choice, side, "overlap")
+    return text
+
+
+def _nine_note_for_signal(signal_name, signal_date):
+    pairs = _overlap_long_pairs if signal_name == "底背离" else _overlap_short_pairs
+    note = tv.nine_overlap_note(pairs, signal_date, pivot_order)
+    if note:
+        return note
+    return "无。这一条背离没有和九转第 7、8、9 根重合。"
+
+
+def _nine_note_in_window():
+    cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=recent_window_days)
+    bits = []
+    for pairs, side in ((_overlap_long_pairs, "买入"), (_overlap_short_pairs, "做空")):
+        if pairs is None or len(pairs) == 0:
+            continue
+        entries = pd.DatetimeIndex(
+            pd.to_datetime(pairs["entry"]).map(tv._naive_timestamp)
+        ).normalize()
+        hit = pairs.loc[entries >= cutoff]
+        for _, one in hit.iterrows():
+            entry = tv._naive_timestamp(one["entry"])
+            bits.append(f"{entry.date().isoformat()} {side}")
+    if not bits:
+        return "无。近窗口没有九转第 7、8、9 根与已确认背离点重合。"
+    listed = "、".join(dict.fromkeys(bits))
+    return (
+        "有。入场落在近窗口："
+        f"{listed}。入场取较晚的一根收盘（九转第 9 根，或背离确认的最后一根）。"
+        "这是对已确认背离的加强，不是另一条独立信号。"
     )
 
 
 st.subheader(f"近 {recent_window_label} 信号")
 if recent.empty:
     st.info(f"近 {recent_window_label} 无信号")
+    _window_note = _nine_note_in_window()
+    if not _window_note.startswith("无"):
+        st.warning(_window_note)
 else:
-    st.dataframe(recent, width="stretch", alt=f"近{recent_window_label}背离信号")
+    recent = recent.copy()
+    recent["配合"] = [
+        tv.nine_overlap_note(
+            _overlap_long_pairs if row.signal == "底背离" else _overlap_short_pairs,
+            row.date,
+            pivot_order,
+        ) or "—"
+        for row in recent.itertuples(index=False)
+    ]
+    recent["方法"] = [
+        _method_note_for_signal(row.signal, row.配合 != "—")
+        for row in recent.itertuples(index=False)
+    ]
+    st.caption("「方法」列写这条背离是不是该方向的主方法。若这一条同时是九转配合，后面接着写加仓还是只标记。")
+    if recent["配合"].ne("—").any():
+        st.warning("下面有信号同时是九转配合已确认背离。配合列写了入场日。大号星标在主图的入场那根上。")
+    st.dataframe(recent, width="stretch", alt=f"近{recent_window_label}背离信号及主方法判定")
 
 with st.container(border=True):
     st.subheader("决策 prompt")
@@ -1856,6 +2295,12 @@ with st.container(border=True):
         seen = {}
         for _, row in ordered.iterrows():
             label = f"{row['date']} · {row['signal']} · 共振 {int(row['indicator_count'])}"
+            if tv.nine_overlap_note(
+                _overlap_long_pairs if row["signal"] == "底背离" else _overlap_short_pairs,
+                row["date"],
+                pivot_order,
+            ):
+                label += " · 九转配合"
             if label in seen:
                 seen[label] += 1
                 label = f"{label} · 收盘 {_px(row['close'])}"

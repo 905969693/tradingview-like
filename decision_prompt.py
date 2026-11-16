@@ -69,6 +69,8 @@ _TECHNICAL_SECTION = """## 技术面点评
 - 共振数
 - 滤波状态
 - 相对均线的位置
+- 九转配合
+- 方法选择
 - 该方向的 5/10/20 日后验
 """
 
@@ -103,6 +105,8 @@ def build_decision_prompt(
     ma_note,
     adx_note,
     posterior,
+    nine_note="无",
+    method_note="无",
 ):
     """用当前页已经算好的事实填一段给外部模型的研究 prompt。
 
@@ -130,6 +134,8 @@ def build_decision_prompt(
 - 滤波状态：{filter_status}
 - 相对均线的位置：{ma_note}
 - ADX：{adx_note}
+- 九转配合：{nine_note}
+- 方法选择：{method_note}
 - 该方向的 5/10/20 日后验（入场是信号确认后的收盘；用来看这段历史里信号有没有超出行情本身，不是对这笔交易的预测）：
 {posterior}
 """
@@ -165,6 +171,8 @@ def build_decision_prompt(
 - 滤波状态：{filter_status}
 - 相对均线的位置：{ma_note}
 - ADX：{adx_note}
+- 九转配合：{nine_note}
+- 方法选择：{method_note}
 - 该方向的 5/10/20 日后验：无当前方向。下面是同一套参数的全样本历史，不是当前这一笔。
 {posterior}
 """
