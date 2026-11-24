@@ -1088,6 +1088,41 @@ def _signal_entry_positions(df, sig, entry_shift):
     return pos[keep] + int(entry_shift)
 
 
+def signal_entry_frame(df, sig, entry_shift):
+    """把信号 bar 平移到入场 bar。
+
+    返回 DataFrame，索引是入场日，列 value（原信号值，如共振数）、
+    pivot（背离点或九转第 9 根）、close（入场收盘）。
+    入场还没出现在 df 里的信号丢掉，不编造未来日期。
+    """
+    empty = pd.DataFrame(columns=["value", "pivot", "close"])
+    if sig is None or len(sig) == 0 or df is None or len(df) == 0:
+        return empty
+    pos = df.index.get_indexer(sig.index)
+    keep = pos >= 0
+    if not np.any(keep):
+        return empty
+    entry = pos[keep] + int(entry_shift)
+    values = np.asarray(sig)[keep]
+    pivots = sig.index[keep]
+    valid = (entry >= 0) & (entry < len(df))
+    if not np.any(valid):
+        return empty
+    entry = entry[valid]
+    out = pd.DataFrame(
+        {
+            "value": values[valid],
+            "pivot": pivots[valid],
+            "close": df.Close.iloc[entry].to_numpy(dtype=float),
+        },
+        index=df.index[entry],
+    )
+    out.index.name = "entry"
+    if out.index.has_duplicates:
+        out = out[~out.index.duplicated(keep="last")]
+    return out
+
+
 def _signal_horizon_returns(closes, entry_idx, horizon, short):
     """与 signal_returns 的同周期路径一致：能持满的信号都计入，不过滤价格。"""
     closes = np.asarray(closes, dtype=float)

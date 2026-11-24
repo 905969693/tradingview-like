@@ -1598,8 +1598,8 @@ if trend_on:
 # 背离标注：显示窗口内全部信号；顺势/震荡逆势=实心，剔除=空心「·逆」
 ref_bull = bull_f if trend_on else bull_sig
 ref_bear = bear_f if trend_on else bear_sig
-b_all = bull_sig[bull_sig.index >= chart_start]
-r_all = bear_sig[bear_sig.index >= chart_start]
+b_all = bull_sig
+r_all = bear_sig
 _trend_masks = tv.trend_filter_masks(df, ma_n, adx_th) if trend_on else None
 
 
@@ -1626,42 +1626,61 @@ def _split_sig(sig, ref, zone_keep):
 
 b_al, b_ct, b_drop = _split_sig(b_all, ref_bull, _bull_zone)
 r_al, r_ct, r_drop = _split_sig(r_all, ref_bear, _bear_zone)
-if len(b_al):
-    fig.add_trace(go.Scatter(x=b_al.index, y=df.Low.loc[b_al.index] * 0.985,
-        mode="markers+text", text=[f"底x{int(v)}" for v in b_al],
-        textposition="bottom center",
-        marker=dict(symbol="triangle-up", size=12, color="gold"),
-        name=f"底背离({_kept_name})"), row=1, col=1)
-if len(b_ct):
-    fig.add_trace(go.Scatter(x=b_ct.index, y=df.Low.loc[b_ct.index] * 0.985,
-        mode="markers+text", text=[f"底x{int(v)}·震" for v in b_ct],
-        textposition="bottom center",
-        marker=dict(symbol="triangle-up", size=12, color="#26c6da"),
-        name="底背离(震荡·全保留)"), row=1, col=1)
-if len(b_drop):
-    fig.add_trace(go.Scatter(x=b_drop.index, y=df.Low.loc[b_drop.index] * 0.985,
-        mode="markers+text", text=[f"底x{int(v)}·滤" for v in b_drop],
-        textposition="bottom center",
-        marker=dict(symbol="triangle-up-open", size=12, color="#b8860b"),
-        name="底背离(已过滤)"), row=1, col=1)
-if len(r_al):
-    fig.add_trace(go.Scatter(x=r_al.index, y=df.High.loc[r_al.index] * 1.015,
-        mode="markers+text", text=[f"顶x{int(v)}" for v in r_al],
-        textposition="top center",
-        marker=dict(symbol="triangle-down", size=12, color="#ce93d8"),
-        name=f"顶背离({_kept_name})"), row=1, col=1)
-if len(r_ct):
-    fig.add_trace(go.Scatter(x=r_ct.index, y=df.High.loc[r_ct.index] * 1.015,
-        mode="markers+text", text=[f"顶x{int(v)}·震" for v in r_ct],
-        textposition="top center",
-        marker=dict(symbol="triangle-down", size=12, color="#ff7043"),
-        name="顶背离(震荡·全保留)"), row=1, col=1)
-if len(r_drop):
-    fig.add_trace(go.Scatter(x=r_drop.index, y=df.High.loc[r_drop.index] * 1.015,
-        mode="markers+text", text=[f"顶x{int(v)}·滤" for v in r_drop],
-        textposition="top center",
-        marker=dict(symbol="triangle-down-open", size=12, color="#6a1b9a"),
-        name="顶背离(已过滤)"), row=1, col=1)
+
+
+def _entry_visible(sig):
+    """分类仍按背离点；三角画在入场根。入场未出现或落在显示窗外的不画。"""
+    moved = tv.signal_entry_frame(df, sig, pivot_order)
+    if moved.empty:
+        return moved
+    return moved[(moved.index >= chart_start) & (moved.index <= chart_end)]
+
+
+def _mark_divergence(sig, bullish, text_suffix, color, symbol, name):
+    visible = _entry_visible(sig)
+    if visible.empty:
+        return
+    price = df.Low if bullish else df.High
+    scale = 0.985 if bullish else 1.015
+    prefix = "底" if bullish else "顶"
+    y = price.reindex(visible.index) * scale
+    hover = (
+        f"{prefix}背离 入场 %{{x|%Y-%m-%d}}<br>"
+        "共振 x%{customdata[0]}<br>"
+        "背离点 %{customdata[1]}<br>"
+        "入场收盘 %{customdata[2]:,.2f}<extra></extra>"
+    )
+    custom = [
+        [
+            int(row.value),
+            pd.Timestamp(row.pivot).strftime("%Y-%m-%d"),
+            float(row.close),
+        ]
+        for row in visible.itertuples()
+    ]
+    fig.add_trace(
+        go.Scatter(
+            x=visible.index,
+            y=y,
+            mode="markers+text",
+            text=[f"{prefix}x{int(row.value)}{text_suffix}" for row in visible.itertuples()],
+            textposition="bottom center" if bullish else "top center",
+            marker=dict(symbol=symbol, size=12, color=color),
+            name=name,
+            customdata=custom,
+            hovertemplate=hover,
+        ),
+        row=1,
+        col=1,
+    )
+
+
+_mark_divergence(b_al, True, "", "gold", "triangle-up", f"底背离({_kept_name})")
+_mark_divergence(b_ct, True, "·震", "#26c6da", "triangle-up", "底背离(震荡·全保留)")
+_mark_divergence(b_drop, True, "·滤", "#b8860b", "triangle-up-open", "底背离(已过滤)")
+_mark_divergence(r_al, False, "", "#ce93d8", "triangle-down", f"顶背离({_kept_name})")
+_mark_divergence(r_ct, False, "·震", "#ff7043", "triangle-down", "顶背离(震荡·全保留)")
+_mark_divergence(r_drop, False, "·滤", "#6a1b9a", "triangle-down-open", "顶背离(已过滤)")
 
 _td_completed_dn, _td_completed_up = tv.td_completed_nines(df.Close)
 _overlap_long_pairs = tv.confirmed_nine_overlap_pairs(
@@ -1802,9 +1821,10 @@ st.plotly_chart(
 )
 _n_overlap_vis = len(_chart_overlap(_overlap_long)) + len(_chart_overlap(_overlap_short))
 st.caption(
+    f"顶、底背离的三角标在真实入场根：背离点后再数 {pivot_order} 根{bar_unit}线的收盘，不是标在背离点本身。"
     "大号星标是九转配合已确认背离的入场，和普通三角不是同一种标记。"
     f"九转用计数 7、8、9，背离点左右各 {pivot_order} 根，入场取较晚的一根收盘。"
-    f" 这张图上有 {_n_overlap_vis} 个。"
+    f" 这张图上有 {_n_overlap_vis} 个星标。"
 )
 
 if _measure_on and _mstats is not None:
@@ -1852,7 +1872,8 @@ if trend_on:
             "「·滤」= 该环境下规则不保留（不是信号失效）；"
             "「·震」= 震荡段保留的背离。"
             f" {_edge_note}"
-            " 判定按信号当日收盘 vs MA，不是整段 K 线视觉位置。"
+            " 判定按背离点当日收盘 vs MA，不是整段 K 线视觉位置。"
+            " 三角画在入场根，是否保留仍按背离点当日。"
         )
 
 # ---------------- 统计区 ----------------
