@@ -36,7 +36,7 @@ PERIOD = "2y"
 PIVOT_ORDER = 6
 MIN_COUNT = 3
 DEDUP_BARS = 10
-SIGNAL_RECENT_DAYS = 7
+SIGNAL_RECENT_DAYS = 30
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 INDICATORS = ["RSI", "MACD_H", "STOCH_K", "MOM", "CMF", "MFI", "OBV", "CCI"]
@@ -315,14 +315,14 @@ def run_batch(tickers, out_dir=None):
         summary_rows.append(
             {
                 "ticker": r["ticker"],
-                "alert_past_7d": bool(rec),
-                "signals_past_7d": len(rec),
+                "alert_past_30d": bool(rec),
+                "signals_past_30d": len(rec),
                 "chart": r["chart_path"],
             }
         )
     for err in errors:
         summary_rows.append(
-            {"ticker": err["ticker"], "alert_past_7d": False, "signals_past_7d": 0, "chart": "", "error": err["error"]}
+            {"ticker": err["ticker"], "alert_past_30d": False, "signals_past_30d": 0, "chart": "", "error": err["error"]}
         )
     summary_path = out_dir / "run_summary.csv"
     pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
@@ -331,7 +331,7 @@ def run_batch(tickers, out_dir=None):
     print(f"Charts folder: {out_dir}")
     print(f"Recent signals (past {SIGNAL_RECENT_DAYS} days): {alerts_path}")
     if not alerts_df.empty:
-        print("\n=== Alerts (past 7 days) ===")
+        print(f"\n=== Alerts (past {SIGNAL_RECENT_DAYS} days) ===")
         print(alerts_df.to_string(index=False))
     else:
         print(f"\nNo divergence signals in the past {SIGNAL_RECENT_DAYS} days for this ticker list.")

@@ -101,7 +101,7 @@ macOS 计划任务每天 07:00 和 18:10（本机时区）跑 `daily_update.py`�
 |---|---|---|
 | `TICKERS` | SPY、USDJPY=X、KBE、USO、TLT、GLD、EEM、SOXX、1810.HK | 批处理标的列表。支持美股、外汇（USDJPY=X）、港股（1810.HK）、A 股指数（000001.SS，Yahoo 数据质量一般建议换 akshare） |
 | `PERIOD` | 5y | 数据区间。**信号统计建议至少 5 年**，2 年数据去重后信号太少，统计结论不可靠；有缓存后增量更新很快 |
-| `SIGNAL_RECENT_DAYS` | 7 | "近 N 日信号"告警的截断窗口，输出到 `signals_recent.csv` |
+| `SIGNAL_RECENT_DAYS` | 30 | "近 N 日信号"告警的截断窗口（一个月，按 30 个自然日），输出到 `signals_recent.csv` |
 
 ## 输出文件
 
@@ -110,7 +110,7 @@ macOS 计划任务每天 07:00 和 18:10（本机时区）跑 `daily_update.py`�
 - `{ticker}.png` — 主图：K线 + MA/VWMA + 布林带 + 趋势背景 + 背离标注
 - `returns_{ticker}.png` — 底/顶背离后验收益分布直方图（5/10/20 日三色）
 - `stats_{ticker}.csv` / `signal_stats_all.csv` — 单标的/跨标的信号后验统计表
-- `signals_recent.csv` — 近 7 日全标的信号告警
+- `signals_recent.csv` — 近 30 日全标的信号告警
 - `run_summary.csv` — 运行摘要
 
 回测脚本输出在 `backtest/` 下：

@@ -7,7 +7,7 @@
     streamlit run dashboard.py
 
 左侧选标的/调参数，右侧联动：主图(K线+均线+布林+背离标注)
-+ 十字光标/区间测量(A→B) + 信号后验统计表 + 后验收益分布 + 近7日信号。
++ 十字光标/区间测量(A→B) + 信号后验统计表 + 后验收益分布 + 近30日信号。
 """
 import sys
 from pathlib import Path
