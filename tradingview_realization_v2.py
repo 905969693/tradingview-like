@@ -328,11 +328,29 @@ def td_current_counts(close, lookback=4):
     return _trailing(True), _trailing(False)
 
 
-def drop_incomplete_daily_bar(df, now=None):
-    """若最后一根日 K 的日期仍处于未收盘的常规交易日，则去掉。
+def market_session_close(ticker=None):
+    """该标的常规收盘所用的时区和整点小时。无法识别时按美股 16:00。"""
+    name = str(ticker or "").upper().replace("-", "_")
+    if name.endswith(".HK"):
+        return "Asia/Hong_Kong", 16
+    if name.endswith(".SI"):
+        return "Asia/Singapore", 17
+    if name.endswith(".SS") or name.endswith(".SZ"):
+        return "Asia/Shanghai", 15
+    if name.endswith(".KS") or name.endswith(".KQ") or name.endswith("KS11"):
+        return "Asia/Seoul", 16
+    if name.endswith(".T"):
+        return "Asia/Tokyo", 15
+    if name.endswith("=X") or name.endswith("_X"):
+        return "America/New_York", 17
+    return "America/New_York", 16
 
-    美股、港股、新加坡常规收盘按当地 16:00 计。Yahoo 增量更新在盘中
-    可能写入当天半根，九转提醒只用已经走完的日 K。
+
+def drop_incomplete_daily_bar(df, now=None, ticker=None):
+    """若最后一根日 K 的日期仍处于该标的未收盘的常规交易日，则去掉。
+
+    按标的交易所时区判断，不把已收盘的港股、新交所日 K 当成美股盘中半根。
+    Yahoo 增量更新在盘中可能写入当天半根，九转提醒只用已经走完的日 K。
     """
     if df is None or len(df) == 0:
         return df
@@ -345,19 +363,19 @@ def drop_incomplete_daily_bar(df, now=None):
         else:
             now = now.tz_convert("UTC")
     last = pd.Timestamp(df.index[-1]).tz_localize(None).normalize()
-    for zone in ("America/New_York", "Asia/Hong_Kong", "Asia/Singapore"):
-        local = now.tz_convert(zone)
-        if last != pd.Timestamp(local.date()):
-            continue
-        session_close = local.normalize() + pd.Timedelta(hours=16)
-        if local < session_close:
-            return df.iloc[:-1]
+    zone, close_hour = market_session_close(ticker)
+    local = now.tz_convert(zone)
+    if last != pd.Timestamp(local.date()):
+        return df
+    session_close = local.normalize() + pd.Timedelta(hours=close_hour)
+    if local < session_close:
+        return df.iloc[:-1]
     return df
 
 
-def bars_for_complete_session(daily_df, timeframe="日线", now=None):
+def bars_for_complete_session(daily_df, timeframe="日线", now=None, ticker=None):
     """日线去掉尚未收盘的当天；周线再用完整周五周 K（去掉未走完的一周）。"""
-    daily_df = drop_incomplete_daily_bar(daily_df, now=now)
+    daily_df = drop_incomplete_daily_bar(daily_df, now=now, ticker=ticker)
     if timeframe == "周线":
         return resample_ohlcv(daily_df, drop_partial=True)
     return daily_df

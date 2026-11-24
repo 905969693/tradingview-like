@@ -1270,6 +1270,7 @@ def scan_td_nine_reminders(tickers_tuple, period, timeframe, data_rev, min_count
             d = tv.bars_for_complete_session(
                 tv.load_ohlcv(t, period=period),
                 timeframe=timeframe,
+                ticker=t,
             )
             if d is None or len(d) == 0:
                 continue
