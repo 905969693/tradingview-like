@@ -1259,6 +1259,48 @@ def scan_recent_signals(
             continue  # 某个标的拉取失败不阻塞整体扫描
     return pd.DataFrame(rows)
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def scan_td_nine_reminders(tickers_tuple, period, timeframe, data_rev, min_count=7):
+    """观察列表里，当前周期最后一根完整 K 计数 >= min_count 的九转提醒。"""
+    del data_rev
+    up_rows, down_rows = [], []
+    for t in tickers_tuple:
+        try:
+            d = tv.bars_for_complete_session(
+                tv.load_ohlcv(t, period=period),
+                timeframe=timeframe,
+            )
+            if d is None or len(d) == 0:
+                continue
+            up_n, down_n = tv.td_current_counts(d.Close)
+            last = pd.Timestamp(d.index[-1])
+            row = {
+                "标的": t,
+                "计数": None,
+                "日期": last.date().isoformat(),
+                "收盘": float(d.Close.iloc[-1]),
+            }
+            if up_n >= min_count:
+                item = dict(row)
+                item["计数"] = int(up_n)
+                up_rows.append(item)
+            if down_n >= min_count:
+                item = dict(row)
+                item["计数"] = int(down_n)
+                down_rows.append(item)
+        except Exception:
+            continue
+    columns = ["标的", "计数", "日期", "收盘"]
+    up_df = pd.DataFrame(up_rows, columns=columns)
+    down_df = pd.DataFrame(down_rows, columns=columns)
+    if not up_df.empty:
+        up_df = up_df.sort_values(["计数", "标的"], ascending=[False, True]).reset_index(drop=True)
+    if not down_df.empty:
+        down_df = down_df.sort_values(["计数", "标的"], ascending=[False, True]).reset_index(drop=True)
+    return up_df, down_df
+
+
 # 放侧边栏：展开面板，不占用主界面
 with st.sidebar.expander(f"🔔 近{recent_window_label}有信号的标的", expanded=True):
     scan = scan_recent_signals(
@@ -1278,6 +1320,47 @@ with st.sidebar.expander(f"🔔 近{recent_window_label}有信号的标的", exp
                 lambda s: _color(s), subset=["最新信号"]),
             width="stretch", hide_index=True,
         )
+
+with st.sidebar.expander("🔔 九转提醒（计数≥7）", expanded=True):
+    st.caption(
+        "看当前 K 线周期最后一根完整 K 的计数。"
+        "日线会去掉尚未收盘的当天，周线只用已收完的周五周 K。"
+        "上涨九转是收盘连续高于 4 根前，下跌九转相反。"
+        "列出计数为 7、8、9 的标的，刚走完第 9 根也会出现。"
+        "这是观察列表提醒，不是买卖建议。"
+    )
+    _td_up_rem, _td_dn_rem = scan_td_nine_reminders(
+        tuple(tickers),
+        period,
+        timeframe,
+        st.session_state.get("price_cache_nonce", 0),
+    )
+
+    def _show_td_reminder(title, table, color, alt):
+        st.markdown(f"**{title}**")
+        if table.empty:
+            st.caption("当前没有计数 ≥ 7 的标的")
+            return
+        styled = table.style.map(lambda _: f"color: {color}", subset=["计数"])
+        st.dataframe(
+            styled,
+            width="stretch",
+            hide_index=True,
+            alt=alt,
+        )
+
+    _show_td_reminder(
+        "上涨九转",
+        _td_up_rem,
+        "#ef5350",
+        "观察列表里当前上涨九转计数达到 7 或以上的标的",
+    )
+    _show_td_reminder(
+        "下跌九转",
+        _td_dn_rem,
+        "#26a69a",
+        "观察列表里当前下跌九转计数达到 7 或以上的标的",
+    )
 
 
 @st.cache_data(ttl="15m", max_entries=8, show_spinner=False)

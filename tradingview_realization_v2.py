@@ -298,6 +298,71 @@ def td_completed_nines(close, lookback=4):
     return down[down == 9], up[up == 9]
 
 
+def td_current_counts(close, lookback=4):
+    """最后一根 K 线上，上涨和下跌九转的当前计数（1–9，没有则为 0）。
+
+    与 td_sequential_counts 同一套比较：收盘高于 lookback 根前计入上涨，
+    低于则计入下跌。连续段每满 9 根重新起计；当前计数是贴着最后一根、
+    尚未中断的这一段已经走过的根数（正好走完 9 则为 9）。不受 show_from
+    影响，图上未标注的 1–4 也会返回。
+    """
+    c = np.asarray(close, dtype=float)
+    n = len(c)
+    if n <= lookback:
+        return 0, 0
+
+    def _trailing(higher):
+        length = 0
+        for i in range(n - 1, lookback - 1, -1):
+            if higher and c[i] > c[i - lookback]:
+                length += 1
+            elif (not higher) and c[i] < c[i - lookback]:
+                length += 1
+            else:
+                break
+        if length == 0:
+            return 0
+        remainder = length % 9
+        return 9 if remainder == 0 else int(remainder)
+
+    return _trailing(True), _trailing(False)
+
+
+def drop_incomplete_daily_bar(df, now=None):
+    """若最后一根日 K 的日期仍处于未收盘的常规交易日，则去掉。
+
+    美股、港股、新加坡常规收盘按当地 16:00 计。Yahoo 增量更新在盘中
+    可能写入当天半根，九转提醒只用已经走完的日 K。
+    """
+    if df is None or len(df) == 0:
+        return df
+    if now is None:
+        now = pd.Timestamp.now(tz="UTC")
+    else:
+        now = pd.Timestamp(now)
+        if now.tzinfo is None:
+            now = now.tz_localize("Asia/Hong_Kong")
+        else:
+            now = now.tz_convert("UTC")
+    last = pd.Timestamp(df.index[-1]).tz_localize(None).normalize()
+    for zone in ("America/New_York", "Asia/Hong_Kong", "Asia/Singapore"):
+        local = now.tz_convert(zone)
+        if last != pd.Timestamp(local.date()):
+            continue
+        session_close = local.normalize() + pd.Timedelta(hours=16)
+        if local < session_close:
+            return df.iloc[:-1]
+    return df
+
+
+def bars_for_complete_session(daily_df, timeframe="日线", now=None):
+    """日线去掉尚未收盘的当天；周线再用完整周五周 K（去掉未走完的一周）。"""
+    daily_df = drop_incomplete_daily_bar(daily_df, now=now)
+    if timeframe == "周线":
+        return resample_ohlcv(daily_df, drop_partial=True)
+    return daily_df
+
+
 def find_divergences(df, ind, order=PIVOT_ORDER):
     lows = _swing_points(df.Low.values, np.less, order)
     highs = _swing_points(df.High.values, np.greater, order)
